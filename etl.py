@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from edgar import Company, set_identity
 import pandas as pd
 import psycopg2
@@ -39,9 +39,24 @@ def fetch_and_sync_insider_buys():
                         insider = getattr(summary, 'insider_name', 'Unknown')
                         shares = int(summary.net_change)
                         
-                        price = 0.0
+                        tx_date = str(getattr(filing, 'filing_date', datetime.now().date()))
                         try:
                             df_tx = form4.to_dataframe()
+                            if not df_tx.empty:
+                                date_col = None
+                                for col in ['Date', 'Transaction Date', 'transactionDate', 'date']:
+                                    if col in df_tx.columns:
+                                        date_col = col
+                                        break
+                                if date_col:
+                                    valid_dates = pd.to_datetime(df_tx[date_col], errors='coerce').dropna()
+                                    if not valid_dates.empty:
+                                        tx_date = str(valid_dates.max().date())
+                        except Exception:
+                            pass
+
+                        price = 0.0
+                        try:
                             if not df_tx.empty:
                                 price_col = None
                                 for col in ['Price', 'Price per share', 'price']:
@@ -68,9 +83,10 @@ def fetch_and_sync_insider_buys():
                             "shares_bought": shares,
                             "estimated_value": est_value,
                             "activity_type": getattr(summary, 'primary_activity', 'Purchase'),
-                            "ai_summary": f"{insider} acquired +{shares:,} shares of {ticker} ({sector}) on the open market (Est. Value: ${est_value:,})."
+                            "transaction_date": tx_date,
+                            "ai_summary": f"{insider} acquired +{shares:,} shares of {ticker} on {tx_date} (Est. Value: ${est_value:,})."
                         })
-                        print(f"  🟢 BUY DETECTED: {insider} bought +{shares:,} shares of {ticker} (${est_value:,})")
+                        print(f"  🟢 BUY DETECTED: {insider} bought +{shares:,} shares on {tx_date} (${est_value:,})")
             
             except Exception as e:
                 print(f"  ❌ Error scanning {ticker}: {e}")
@@ -85,32 +101,32 @@ def load_to_supabase(df):
     conn = psycopg2.connect(DB_URL)
     cursor = conn.cursor()
     
-    cursor.execute("DELETE FROM insider_buys WHERE estimated_value = 0 OR estimated_value IS NULL;")
-    
     for _, row in df.iterrows():
         try:
             sql = """
                 INSERT INTO insider_buys 
-                (ticker, sector, insider_name, shares_bought, estimated_value, activity_type, ai_summary)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                (ticker, sector, insider_name, shares_bought, estimated_value, activity_type, transaction_date, ai_summary)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (ticker, insider_name, shares_bought) 
                 DO UPDATE SET 
                     estimated_value = EXCLUDED.estimated_value,
+                    transaction_date = EXCLUDED.transaction_date,
                     ai_summary = EXCLUDED.ai_summary;
             """
-            cursor.execute(sql, (
+cursor.execute(sql, (
                 row['ticker'], row['sector'], row['insider_name'], 
                 row['shares_bought'], row['estimated_value'], 
-                row['activity_type'], row['ai_summary']
+                row['activity_type'], row['transaction_date'], row['ai_summary']
             ))
+            
         except Exception as e:
             print(f"DB Insert Error for {row['ticker']}: {e}")
             
     conn.commit()
     cursor.close()
     conn.close()
-    print("✅ Successfully synced automated records to Supabase!")
+    print("✅ Successfully synced automated records with dates to Supabase!")
 
 if __name__ == "__main__":
     df_buys = fetch_and_sync_insider_buys()
-    load_to_supabase(df_buys)
+    load_to_supabase(df_buys)D
