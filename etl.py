@@ -1,4 +1,5 @@
 import os
+import xml.etree.ElementTree as ET
 import pandas as pd
 from edgar import get_filings, set_identity
 import psycopg2
@@ -9,7 +10,7 @@ set_identity("JosephLong1226@gmail.com")
 def run_market_wide_etl():
     print("Fetching recent Form 4 filings market-wide...")
     
-    # Get recent Form 4 filings from the SEC feed
+    # Fetch recent Form 4 filings from SEC EDGAR feed
     filings = get_filings(form="4")
     recent_filings = filings.head(100)
     
@@ -17,39 +18,51 @@ def run_market_wide_etl():
 
     for filing in recent_filings:
         try:
-            form4 = filing.obj()
-            if form4 is None:
+            # Extract raw XML content directly
+            xml_content = filing.xml()
+            if not xml_content:
                 continue
 
-            summary = form4.get_ownership_summary()
-            if summary is None or not hasattr(summary, 'transactions') or not summary.transactions:
-                continue
+            root = ET.fromstring(xml_content)
 
-            insider = getattr(summary, 'insider_name', None) or getattr(filing, 'company', 'Insider Trader')
-            ticker_symbol = getattr(summary, 'issuer', None) or getattr(filing, 'company', 'UNKNOWN')
+            # Extract Insider & Ticker Metadata
+            issuer_ticker_elem = root.find(".//issuer/issuerTradingSymbol")
+            ticker = issuer_ticker_elem.text.upper() if issuer_ticker_elem is not None and issuer_ticker_elem.text else "UNKNOWN"
 
-            for t in summary.transactions:
-                # Code 'P' = Open Market Purchase
-                code = getattr(t, 'code', '') or ''
-                if str(code).upper() == 'P':
-                    shares = float(getattr(t, 'shares_numeric', 0) or 0)
-                    price = float(getattr(t, 'price_numeric', 0) or 0)
-                    est_val = shares * price
+            rpt_owner_elem = root.find(".//reportingOwner/reportingOwnerId/rptOwnerName")
+            insider = rpt_owner_elem.text if rpt_owner_elem is not None and rpt_owner_elem.text else "Insider Trader"
 
-                    # Filter for trades $50,000+
-                    if est_val >= 50000 and shares > 0:
-                        tx_date = str(getattr(t, 'date', None) or getattr(filing, 'filing_date', ''))
-                        parsed_transactions.append({
-                            "transaction_date": tx_date,
-                            "ticker": str(ticker_symbol),
-                            "sector": "Unclassified",
-                            "insider_name": str(insider),
-                            "shares_bought": int(shares),
-                            "est_value": float(est_val),
-                            "activity_type": "Purchase",
-                            "ai_summary": f"{insider} acquired +{int(shares):,} shares of {ticker_symbol} via open-market purchase worth ${est_val:,.0f}."
-                        })
+            # Parse non-derivative open-market transactions
+            for tx in root.findall(".//nonDerivativeTransaction"):
+                code_elem = tx.find(".//transactionCoding/transactionCode")
+                if code_elem is None or code_elem.text != "P":
+                    continue  # Only keep 'P' (Open Market Purchases)
+
+                shares_elem = tx.find(".//transactionAmounts/transactionShares/value")
+                price_elem = tx.find(".//transactionAmounts/transactionPricePerShare/value")
+                date_elem = tx.find(".//transactionDate/value")
+
+                shares = float(shares_elem.text) if shares_elem is not None and shares_elem.text else 0.0
+                price = float(price_elem.text) if price_elem is not None and price_elem.text else 0.0
+                tx_date = date_elem.text if date_elem is not None and date_elem.text else str(filing.filing_date)
+
+                est_val = shares * price
+
+                # Filter for transactions over $50,000
+                if est_val >= 50000 and shares > 0:
+                    parsed_transactions.append({
+                        "transaction_date": tx_date,
+                        "ticker": ticker,
+                        "sector": "Unclassified",
+                        "insider_name": insider,
+                        "shares_bought": int(shares),
+                        "est_value": float(est_val),
+                        "activity_type": "Purchase",
+                        "ai_summary": f"{insider} acquired +{int(shares):,} shares of {ticker} via open-market purchase worth ${est_val:,.0f}."
+                    })
+
         except Exception:
+            # Skip any malformed single filing without crashing the loop
             continue
 
     df_new = pd.DataFrame(parsed_transactions)
@@ -64,6 +77,23 @@ def run_market_wide_etl():
     conn_url = os.environ.get("SUPABASE_DB_URL")
     conn = psycopg2.connect(conn_url)
     cursor = conn.cursor()
+
+    # Ensure table exists before executing inserts
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS insider_trades (
+            id SERIAL PRIMARY KEY,
+            transaction_date TEXT,
+            ticker TEXT,
+            sector TEXT,
+            insider_name TEXT,
+            shares_bought BIGINT,
+            est_value NUMERIC,
+            activity_type TEXT,
+            ai_summary TEXT,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            CONSTRAINT unique_trade UNIQUE (transaction_date, ticker, insider_name, shares_bought, est_value)
+        );
+    """)
 
     for _, row in df_new.iterrows():
         cursor.execute("""
