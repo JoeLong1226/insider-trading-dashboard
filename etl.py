@@ -9,7 +9,7 @@ set_identity("JosephLong1226@gmail.com")
 def run_market_wide_etl():
     print("Fetching recent Form 4 filings market-wide...")
     
-    # Fetch recent Form 4 filings
+    # Fetch recent Form 4 filings from the SEC feed
     filings = get_filings(form="4")
     recent_filings = filings.head(100)
     
@@ -20,45 +20,48 @@ def run_market_wide_etl():
             form4 = filing.obj()
             if form4 is None:
                 continue
-                
-            # Extract transactions dataframe from the Form 4 object
-            df_tx = form4.to_dataframe()
-            if df_tx is None or df_tx.empty:
-                continue
 
-            # Check for open market purchase code 'P'
-            # (edgartools dataframes include 'AcquiredDisposed', 'Code', 'Shares', 'Price', 'TransactionDate')
-            p_buys = df_tx[df_tx['Code'].str.upper() == 'P'] if 'Code' in df_tx.columns else pd.DataFrame()
+            # Access market trades directly via edgartools
+            trades_df = getattr(form4, 'market_trades', None)
+            
+            if trades_df is not None and not trades_df.empty:
+                # Filter for open-market purchases (Code 'P')
+                if 'Code' in trades_df.columns:
+                    p_buys = trades_df[trades_df['Code'].str.upper() == 'P']
+                else:
+                    p_buys = trades_df
 
-            if not p_buys.empty:
-                insider_name = getattr(form4, 'reporting_owner_name', 'Insider Trader')
-                issuer = getattr(form4, 'issuer', filing.company)
+                insider = getattr(form4, 'insider_name', None) or getattr(form4, 'reporting_owner_name', 'Insider Trader')
+                ticker_symbol = getattr(filing, 'ticker', None) or getattr(filing, 'company', 'UNKNOWN')
 
                 for _, tx in p_buys.iterrows():
-                    shares = float(tx.get('Shares', 0) or 0)
-                    price = float(tx.get('Price', 0) or 0)
-                    est_val = shares * price if price > 0 else float(tx.get('Value', 0) or 0)
+                    shares = float(tx.get('Shares', 0) or tx.get('shares', 0) or 0)
+                    price = float(tx.get('Price', 0) or tx.get('price', 0) or 0)
+                    
+                    # Calculate estimated value if not explicitly given
+                    est_val = float(tx.get('Value', 0) or tx.get('value', 0) or (shares * price))
 
-                    # Filter for trades over $50k (or lower if testing)
-                    if est_val >= 50000:
-                        tx_date = str(tx.get('TransactionDate') or filing.filing_date)
+                    # Filter for transaction threshold ($50,000+)
+                    if est_val >= 50000 and shares > 0:
+                        tx_date = str(tx.get('TransactionDate') or tx.get('date') or filing.filing_date)
                         parsed_transactions.append({
                             "transaction_date": tx_date,
-                            "ticker": str(issuer),
+                            "ticker": str(ticker_symbol),
                             "sector": "Unclassified",
-                            "insider_name": str(insider_name),
+                            "insider_name": str(insider),
                             "shares_bought": int(shares),
                             "est_value": float(est_val),
                             "activity_type": "Purchase",
-                            "ai_summary": f"{insider_name} acquired +{int(shares):,} shares of {issuer} via open-market purchase worth ${est_val:,.0f}."
+                            "ai_summary": f"{insider} acquired +{int(shares):,} shares of {ticker_symbol} via open-market purchase worth ${est_val:,.0f}."
                         })
-        except Exception:
+        except Exception as e:
+            # Continue on individual filing parse errors
             continue
 
     df_new = pd.DataFrame(parsed_transactions)
     
     if df_new.empty:
-        print("No new high-conviction open market purchases over $50k found in this batch.")
+        print("No new open-market purchases over $50k found in this batch.")
         return
 
     print(f"Extracted {len(df_new)} high-conviction trades. Connecting to Supabase...")
