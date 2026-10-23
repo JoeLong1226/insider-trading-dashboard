@@ -8,11 +8,11 @@ import psycopg2
 set_identity("JosephLong1226@gmail.com")
 
 def run_market_wide_etl():
-    print("Fetching recent Form 4 filings market-wide...")
+    print("Fetching recent Form 4 filings market-wide (deep historical scan)...")
     
-    # Fetch recent Form 4 filings from SEC EDGAR feed
+    # Fetch a larger batch of Form 4 filings from SEC EDGAR feed (1,000 filings)
     filings = get_filings(form="4")
-    recent_filings = filings.head(100)
+    recent_filings = filings.head(1000)
     
     parsed_transactions = []
 
@@ -68,10 +68,10 @@ def run_market_wide_etl():
     df_new = pd.DataFrame(parsed_transactions)
     
     if df_new.empty:
-        print("No new open-market purchases over $50k found in this batch.")
+        print("No open-market purchases over $50k found in this batch.")
         return
 
-    print(f"Extracted {len(df_new)} high-conviction trades. Connecting to Supabase...")
+    print(f"Extracted {len(df_new)} high-conviction trades from deep scan. Connecting to Supabase...")
 
     # Connect to Supabase PostgreSQL and Upsert
     conn_url = os.environ.get("SUPABASE_DB_URL")
@@ -114,7 +114,7 @@ def run_market_wide_etl():
     conn.commit()
     cursor.close()
     conn.close()
-    print("ETL market-wide sync completed successfully!")
+    print("ETL deep historical sync completed successfully!")
 
 if __name__ == "__main__":
     run_market_wide_etl()
