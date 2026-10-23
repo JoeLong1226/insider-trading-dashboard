@@ -1,57 +1,69 @@
 import os
-from datetime import datetime
 import pandas as pd
 from edgar import get_filings, set_identity
 import psycopg2
 
-# 1. Set required SEC EDGAR identity (use your email)
+# Set required SEC EDGAR identity
 set_identity("JosephLong1226@gmail.com")
 
 def run_market_wide_etl():
     print("Fetching recent Form 4 filings market-wide...")
     
-    # Get all Form 4 filings from the recent SEC feed
+    # Fetch recent Form 4 filings
     filings = get_filings(form="4")
-    
-    # Take the most recent batch (e.g., latest 100-200 filings to stay well within GitHub limits)
-    recent_filings = filings.head(150)
+    recent_filings = filings.head(100)
     
     parsed_transactions = []
 
     for filing in recent_filings:
         try:
             form4 = filing.obj()
-            summary = form4.get_ownership_summary()
-            
-            # Ensure it's a purchase and has valid value/net change
-            if summary and summary.net_change and summary.net_change > 0:
-                # Loop through individual transactions in the filing
-                for t in summary.transactions:
-                    # Filter for open-market purchase code 'P'
-                    if t.code == 'P' and t.value and t.value >= 50000:
+            if form4 is None:
+                continue
+                
+            # Extract transactions dataframe from the Form 4 object
+            df_tx = form4.to_dataframe()
+            if df_tx is None or df_tx.empty:
+                continue
+
+            # Check for open market purchase code 'P'
+            # (edgartools dataframes include 'AcquiredDisposed', 'Code', 'Shares', 'Price', 'TransactionDate')
+            p_buys = df_tx[df_tx['Code'].str.upper() == 'P'] if 'Code' in df_tx.columns else pd.DataFrame()
+
+            if not p_buys.empty:
+                insider_name = getattr(form4, 'reporting_owner_name', 'Insider Trader')
+                issuer = getattr(form4, 'issuer', filing.company)
+
+                for _, tx in p_buys.iterrows():
+                    shares = float(tx.get('Shares', 0) or 0)
+                    price = float(tx.get('Price', 0) or 0)
+                    est_val = shares * price if price > 0 else float(tx.get('Value', 0) or 0)
+
+                    # Filter for trades over $50k (or lower if testing)
+                    if est_val >= 50000:
+                        tx_date = str(tx.get('TransactionDate') or filing.filing_date)
                         parsed_transactions.append({
-                            "transaction_date": t.date or filing.filing_date,
-                            "ticker": summary.issuer,
-                            "sector": "Unclassified", # Can map sectors dynamically if desired
-                            "insider_name": summary.insider_name,
-                            "shares_bought": t.shares_numeric,
-                            "est_value": t.value,
+                            "transaction_date": tx_date,
+                            "ticker": str(issuer),
+                            "sector": "Unclassified",
+                            "insider_name": str(insider_name),
+                            "shares_bought": int(shares),
+                            "est_value": float(est_val),
                             "activity_type": "Purchase",
-                            "ai_summary": f"{summary.insider_name} acquired +{t.shares_numeric:,} shares of {summary.issuer} via open-market purchase worth ${t.value:,.0f}."
+                            "ai_summary": f"{insider_name} acquired +{int(shares):,} shares of {issuer} via open-market purchase worth ${est_val:,.0f}."
                         })
-        except Exception as e:
-            # Skip malformed or unparseable filings silently to keep the job running smoothly
+        except Exception:
             continue
 
     df_new = pd.DataFrame(parsed_transactions)
     
     if df_new.empty:
-        print("No new high-conviction purchases found in this batch.")
+        print("No new high-conviction open market purchases over $50k found in this batch.")
         return
 
     print(f"Extracted {len(df_new)} high-conviction trades. Connecting to Supabase...")
 
-    # 2. Connect to Supabase PostgreSQL and Upsert
+    # Connect to Supabase PostgreSQL and Upsert
     conn_url = os.environ.get("SUPABASE_DB_URL")
     conn = psycopg2.connect(conn_url)
     cursor = conn.cursor()
