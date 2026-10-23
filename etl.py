@@ -21,41 +21,31 @@ def run_market_wide_etl():
             if form4 is None:
                 continue
 
-            # Access market trades directly via edgartools
-            trades_df = getattr(form4, 'market_trades', None)
-            
-            if trades_df is not None and not trades_df.empty:
-                # Filter for open-market purchases (Code 'P')
-                if 'Code' in trades_df.columns:
-                    p_buys = trades_df[trades_df['Code'].str.upper() == 'P']
-                else:
-                    p_buys = trades_df
+            # Use edgartools native ownership summary object
+            summary = form4.get_ownership_summary()
+            if summary is None:
+                continue
 
-                insider = getattr(form4, 'insider_name', None) or getattr(form4, 'reporting_owner_name', 'Insider Trader')
-                ticker_symbol = getattr(filing, 'ticker', None) or getattr(filing, 'company', 'UNKNOWN')
+            # Check if it's an open-market net purchase with a positive value
+            net_change = getattr(summary, 'net_change', 0) or 0
+            net_value = getattr(summary, 'net_value', 0) or 0
 
-                for _, tx in p_buys.iterrows():
-                    shares = float(tx.get('Shares', 0) or tx.get('shares', 0) or 0)
-                    price = float(tx.get('Price', 0) or tx.get('price', 0) or 0)
-                    
-                    # Calculate estimated value if not explicitly given
-                    est_val = float(tx.get('Value', 0) or tx.get('value', 0) or (shares * price))
+            if net_change > 0 and net_value >= 50000:
+                insider = getattr(summary, 'insider_name', 'Insider Trader')
+                issuer = getattr(summary, 'issuer', getattr(filing, 'company', 'UNKNOWN'))
+                tx_date = str(getattr(filing, 'filing_date', ''))
 
-                    # Filter for transaction threshold ($50,000+)
-                    if est_val >= 50000 and shares > 0:
-                        tx_date = str(tx.get('TransactionDate') or tx.get('date') or filing.filing_date)
-                        parsed_transactions.append({
-                            "transaction_date": tx_date,
-                            "ticker": str(ticker_symbol),
-                            "sector": "Unclassified",
-                            "insider_name": str(insider),
-                            "shares_bought": int(shares),
-                            "est_value": float(est_val),
-                            "activity_type": "Purchase",
-                            "ai_summary": f"{insider} acquired +{int(shares):,} shares of {ticker_symbol} via open-market purchase worth ${est_val:,.0f}."
-                        })
+                parsed_transactions.append({
+                    "transaction_date": tx_date,
+                    "ticker": str(issuer),
+                    "sector": "Unclassified",
+                    "insider_name": str(insider),
+                    "shares_bought": int(net_change),
+                    "est_value": float(net_value),
+                    "activity_type": "Purchase",
+                    "ai_summary": f"{insider} acquired +{int(net_change):,} shares of {issuer} via open-market purchase worth ${net_value:,.0f}."
+                })
         except Exception as e:
-            # Continue on individual filing parse errors
             continue
 
     df_new = pd.DataFrame(parsed_transactions)
