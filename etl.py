@@ -30,10 +30,12 @@ def fetch_and_sync_insider_buys():
                 
                 for filing in filings:
                     form4 = filing.obj()
-                    if not form4: continue
+                    if not form4:
+                        continue
                     
                     summary = form4.get_ownership_summary()
-                    if not summary: continue
+                    if not summary:
+                        continue
                     
                     if getattr(summary, 'net_change', 0) > 0:
                         insider = getattr(summary, 'insider_name', 'Unknown')
@@ -113,12 +115,16 @@ def load_to_supabase(df):
                     transaction_date = EXCLUDED.transaction_date,
                     ai_summary = EXCLUDED.ai_summary;
             """
-cursor.execute(sql, (
-                row['ticker'], row['sector'], row['insider_name'], 
-                row['shares_bought'], row['estimated_value'], 
-                row['activity_type'], row['transaction_date'], row['ai_summary']
+            cursor.execute(sql, (
+                row['ticker'], 
+                row['sector'], 
+                row['insider_name'], 
+                row['shares_bought'], 
+                row['estimated_value'], 
+                row['activity_type'], 
+                row['transaction_date'], 
+                row['ai_summary']
             ))
-            
         except Exception as e:
             print(f"DB Insert Error for {row['ticker']}: {e}")
             
@@ -129,4 +135,4 @@ cursor.execute(sql, (
 
 if __name__ == "__main__":
     df_buys = fetch_and_sync_insider_buys()
-    load_to_supabase(df_buys)D
+    load_to_supabase(df_buys)
