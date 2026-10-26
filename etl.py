@@ -10,7 +10,7 @@ import random
 set_identity("JosephLong1226@gmail.com")
 
 def get_sector_for_ticker(ticker):
-    """Fetch the market sector for a given ticker using yfinance with fallback cleaning."""
+    """Fetch the market sector or fund type for a given ticker using yfinance with intelligent fallbacks."""
     if not ticker or ticker in ["UNKNOWN", "NONE", "NULL", "N/A"]:
         return "Unclassified"
     
@@ -19,16 +19,29 @@ def get_sector_for_ticker(ticker):
     try:
         stock = yf.Ticker(cleaned_ticker)
         info = stock.info
+        
+        # Check standard sector first
         sector = info.get("sector")
         if sector:
             return sector
+            
+        # Fallback for ETFs, Mutual Funds, and Closed-End Funds that lack corporate sectors
+        quote_type = info.get("quoteType", "").upper()
+        if quote_type == "ETF":
+            return "Funds & ETFs"
+        elif quote_type == "MUTUALFUND":
+            return "Mutual Funds"
+        elif ticker.endswith("X") or len(ticker) == 5:
+            return "Funds & ETFs"
+            
         return "Unclassified"
     except Exception:
+        if ticker.endswith("X"):
+            return "Funds & ETFs"
         return "Unclassified"
 
 def generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date):
     """Generate a dynamic, multi-factor narrative executive takeaway strictly anchored to prior history."""
-    # Check if this insider bought this ticker on an EARLIER date in our database
     cursor.execute("""
         SELECT COUNT(*) 
         FROM insider_trades 
@@ -39,7 +52,6 @@ def generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
     res = cursor.fetchone()
     prior_count = res[0] if res else 0
     
-    # Classify the scale of the trade
     if est_val >= 5000000:
         scale_label = f"a massive, multi-million dollar block worth ${est_val:,.0f}"
     elif est_val >= 1000000:
@@ -49,14 +61,12 @@ def generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
     else:
         scale_label = f"an open-market purchase valued at ${est_val:,.0f}"
 
-    # Pool of dynamic variations for repeat buyers
     repeat_phrases = [
         f"{insider} deepens their conviction in {ticker}, acquiring another +{int(shares):,} shares ({scale_label}) in an ongoing accumulation phase.",
         f"Continuing a pattern of insider buying, {insider} steps up for another round in {ticker}, picking up +{int(shares):,} shares ({scale_label}).",
         f"{insider} adds further weight to their position in {ticker}, securing +{int(shares):,} shares ({scale_label}) in a follow-on transaction."
     ]
 
-    # Pool of dynamic variations for fresh position initiations
     fresh_phrases = [
         f"{insider} establishes a fresh position in {ticker}, picking up +{int(shares):,} shares ({scale_label}).",
         f"Marking a new stake in {ticker}, {insider} acquires +{int(shares):,} shares via {scale_label}.",
@@ -69,19 +79,17 @@ def generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
         return random.choice(fresh_phrases)
 
 def run_market_wide_etl():
-    print("Fetching recent Form 4 filings market-wide (deep historical scan with ticker validation)...")
+    print("Fetching recent Form 4 filings market-wide (deep historical scan with advanced fund & ticker parsing)...")
     
     filings = get_filings(form="4")
     recent_filings = filings.head(1000)
     
     parsed_transactions = []
 
-    # Connect to Supabase PostgreSQL early to check historical context during parsing
     conn_url = os.environ.get("SUPABASE_DB_URL")
     conn = psycopg2.connect(conn_url)
     cursor = conn.cursor()
 
-    # Ensure table exists
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS insider_trades (
             id SERIAL PRIMARY KEY,
@@ -106,12 +114,16 @@ def run_market_wide_etl():
 
             root = ET.fromstring(xml_content)
 
-            # Safely extract and clean Ticker Symbol (handling NONE, NULL, empty values)
+            # Extract Ticker with intelligent fallback to Issuer Name if ticker is NONE/missing
             issuer_ticker_elem = root.find(".//issuer/issuerTradingSymbol")
             raw_ticker = issuer_ticker_elem.text.strip().upper() if issuer_ticker_elem is not None and issuer_ticker_elem.text else ""
             
+            issuer_name_elem = root.find(".//issuer/issuerName")
+            issuer_name = issuer_name_elem.text.strip() if issuer_name_elem is not None and issuer_name_elem.text else "PRIVATE ENTITY"
+
             if raw_ticker in ["", "NONE", "NULL", "N/A", "UNKNOWN"]:
-                ticker = "UNKNOWN"
+                # Use a clean truncated version of the issuer name as identifier if no public ticker exists
+                ticker = issuer_name.split()[0].upper()[:10]
             else:
                 ticker = raw_ticker
 
@@ -136,7 +148,6 @@ def run_market_wide_etl():
                 if est_val >= 50000 and shares > 0:
                     sector = get_sector_for_ticker(ticker)
                     
-                    # Generate strict history-aware narrative takeaway
                     ai_summary = generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
 
                     parsed_transactions.append({
@@ -187,7 +198,7 @@ def run_market_wide_etl():
     conn.commit()
     cursor.close()
     conn.close()
-    print("ETL complete with ticker validation, sector mapping, and narrative upgrades!")
+    print("ETL complete with fund sector classification and entity fallback parsing!")
 
 if __name__ == "__main__":
     run_market_wide_etl()
