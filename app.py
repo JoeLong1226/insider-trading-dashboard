@@ -12,10 +12,11 @@ def get_db_connection():
     conn_url = os.environ.get("SUPABASE_DB_URL")
     return psycopg2.connect(conn_url)
 
-# Helper function to compute unrealized profit including dividends
+# Helper function to compute unrealized profit including dividends with ticker guards
 @st.cache_data(ttl=3600)
 def calculate_trade_performance(ticker, tx_date_str, shares, est_value):
-    if not ticker or ticker in ["UNKNOWN", "NONE", "N/A"] or shares <= 0:
+    # Guard against invalid or missing tickers
+    if not ticker or ticker.upper() in ["UNKNOWN", "NONE", "NULL", "N/A"] or shares <= 0:
         return 0.0, 0.0
 
     cleaned_ticker = ticker.replace(".", "-")
@@ -23,12 +24,17 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value):
     try:
         stock = yf.Ticker(cleaned_ticker)
         tx_date = pd.to_datetime(tx_date_str).tz_localize(None)
-        hist = stock.history(start=tx_date_str)
         
+        # Fetch current price robustly
+        current_price = stock.fast_info.get('lastPrice') or stock.info.get('currentPrice')
+        
+        hist = stock.history(start=tx_date_str)
         if hist.empty:
             return 0.0, 0.0
 
-        current_price = hist['Close'].iloc[-1]
+        if not current_price:
+            current_price = hist['Close'].iloc[-1]
+
         current_equity_val = shares * current_price
         capital_gain = current_equity_val - est_value
         
@@ -74,7 +80,7 @@ try:
 
         # Format column values for executive table display
         df['Unrealized Gain'] = df['Unrealized Profit ($)'].apply(lambda x: f"+${x:,.0f}" if x >= 0 else f"-${abs(x):,.0f}")
-        df['Total Return'] = df['Return (%)'].apply(lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%")
+        df['Total Return'] = df['Return (%)'].apply(lambda x: f"+{x:.1f}%" if x:.1f}%" if x >= 0 else f"{x:.1f}%")
         df['Shares Bought'] = df['shares_bought'].apply(lambda x: f"+{x:,.0f}")
         df['Est. Value ($)'] = df['est_value'].apply(lambda x: f"${x:,.0f}")
 
