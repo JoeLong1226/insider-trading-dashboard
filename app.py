@@ -1,67 +1,108 @@
 import streamlit as st
 import pandas as pd
 import psycopg2
+import os
+import yfinance as yf
 
-# Set Streamlit Page Config
-st.set_page_config(page_title="Insider Trading Dashboard", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Insider Trading Dashboard", layout="wide")
+
+# Connect to Supabase
+@st.cache_resource
+def get_db_connection():
+    conn_url = os.environ.get("SUPABASE_DB_URL")
+    return psycopg2.connect(conn_url)
+
+# Helper function to compute unrealized profit including dividends
+@st.cache_data(ttl=3600)
+def calculate_trade_performance(ticker, tx_date_str, shares, est_value):
+    if not ticker or ticker in ["UNKNOWN", "NONE", "N/A"] or shares <= 0:
+        return 0.0, 0.0
+
+    cleaned_ticker = ticker.replace(".", "-")
+    
+    try:
+        stock = yf.Ticker(cleaned_ticker)
+        tx_date = pd.to_datetime(tx_date_str).tz_localize(None)
+        hist = stock.history(start=tx_date_str)
+        
+        if hist.empty:
+            return 0.0, 0.0
+
+        current_price = hist['Close'].iloc[-1]
+        current_equity_val = shares * current_price
+        capital_gain = current_equity_val - est_value
+        
+        dividends = stock.dividends
+        if not dividends.empty:
+            dividends.index = dividends.index.tz_localize(None)
+            dividends_since_buy = dividends[dividends.index >= tx_date]
+            total_div_per_share = dividends_since_buy.sum()
+        else:
+            total_div_per_share = 0.0
+            
+        total_dividends_collected = shares * total_div_per_share
+        total_dollar_return = capital_gain + total_dividends_collected
+        percent_return = (total_dollar_return / est_value) * 100 if est_value > 0 else 0.0
+        
+        return total_dollar_return, percent_return
+
+    except Exception:
+        return 0.0, 0.0
+
+st.title("📊 Insider Transactions Dashboard")
+st.write("Market-wide tracking of high-conviction open-market executive purchases ($50,000+).")
 
 # Fetch data from Supabase
-@st.cache_data(ttl=60)
-def load_data():
-    conn_url = st.secrets["SUPABASE_DB_URL"]
-    conn = psycopg2.connect(conn_url)
-    
+try:
+    conn = get_db_connection()
     query = """
         SELECT transaction_date, ticker, sector, insider_name, shares_bought, est_value, activity_type, ai_summary 
         FROM insider_trades 
         ORDER BY transaction_date DESC;
     """
     df = pd.read_sql(query, conn)
-    conn.close()
-    return df
 
-# Main Title & Subheader
-st.title("📈 Insider Trading Intelligence Dashboard")
-st.markdown("Market-wide tracking of high-conviction open-market executive purchases ($50,000+).")
+    if not df.empty:
+        # Calculate live gain/loss + dividends for each trade
+        perf = [
+            calculate_trade_performance(row['ticker'], row['transaction_date'], row['shares_bought'], float(row['est_value']))
+            for _, row in df.iterrows()
+        ]
+        
+        df['Unrealized Profit ($)'] = [p[0] for p in perf]
+        df['Return (%)'] = [p[1] for p in perf]
 
-# Load dataset
-try:
-    df = load_data()
+        # Format column values for executive table display
+        df['Unrealized Gain'] = df['Unrealized Profit ($)'].apply(lambda x: f"+${x:,.0f}" if x >= 0 else f"-${abs(x):,.0f}")
+        df['Total Return'] = df['Return (%)'].apply(lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%")
+        df['Shares Bought'] = df['shares_bought'].apply(lambda x: f"+{x:,.0f}")
+        df['Est. Value ($)'] = df['est_value'].apply(lambda x: f"${x:,.0f}")
 
-    if df.empty:
-        st.warning("No transactions found in database.")
-    else:
-        # Metrics Display
+        # Metrics overview row
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Total Trades Tracked", len(df))
-        col2.metric("Unique Tickers", df["ticker"].nunique())
-        col3.metric("Unique Insiders", df["insider_name"].nunique())
+        col2.metric("Unique Tickers", df['ticker'].nunique())
+        col3.metric("Unique Insiders", df['insider_name'].nunique())
         col4.metric("Total Dollar Volume", f"${df['est_value'].sum():,.0f}")
 
-        st.divider()
-
-        # Display Data Table
+        st.markdown("---")
         st.subheader("📋 Insider Transactions Database")
-        
-        # Format columns for display
-        df_display = df.copy()
-        df_display["shares_bought"] = df_display["shares_bought"].apply(lambda x: f"+{x:,.0f}")
-        df_display["est_value"] = df_display["est_value"].apply(lambda x: f"${x:,.0f}")
 
-        st.dataframe(
-            df_display.rename(columns={
-                "transaction_date": "Transaction Date",
-                "ticker": "Ticker",
-                "sector": "Sector",
-                "insider_name": "Insider Name",
-                "shares_bought": "Shares Bought",
-                "est_value": "Est. Value ($)",
-                "activity_type": "Activity Type",
-                "ai_summary": "AI Summary / Executive Takeaway"
-            }),
-            use_container_width=True,
-            hide_index=True
-        )
+        # Select & reorder columns for final display
+        display_df = df[[
+            "transaction_date", "ticker", "sector", "insider_name", 
+            "Shares Bought", "Est. Value ($)", "Unrealized Gain", "Total Return", "ai_summary"
+        ]]
+
+        display_df.columns = [
+            "Transaction Date", "Ticker", "Sector", "Insider Name", 
+            "Shares Bought", "Est. Value ($)", "Unrealized Gain (Inc. Divs)", "Total Return", "AI Executive Takeaway"
+        ]
+
+        st.dataframe(display_df, use_container_width=True)
+
+    else:
+        st.info("No insider transactions found in database.")
 
 except Exception as e:
-    st.error(f"Failed to connect to database: {e}")
+    st.error(f"Error connecting to database or fetching data: {e}")
