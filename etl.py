@@ -11,18 +11,23 @@ import random
 # Set required SEC EDGAR identity
 set_identity("JosephLong1226@gmail.com")
 
-def is_valid_ticker(raw_ticker, issuer_name):
-    """Ensure the ticker is valid, or explicitly map known closed-end funds missing their XML ticker."""
+def is_valid_ticker(raw_ticker, issuer_name, issuer_cik=""):
+    """Ensure the ticker is valid or explicitly resolve closed-end funds like BPRE."""
     name_upper = issuer_name.upper()
     
-    # Explicit mapping for known funds that omit or misformat their trading symbol in Form 4 XMLs
-    if "BLUROCK" in name_upper or "BLUEROCK" in name_upper:
+    # 1. Direct matching for Bluerock Private Real Estate Fund (BPRE)
+    if "BLUEROCK" in name_upper or "BLUROCK" in name_upper or issuer_cik in ["0001851212", "0001560385"]:
         return "BPRE"
         
     if not raw_ticker or not isinstance(raw_ticker, str):
         return None
         
-    clean = raw_ticker.strip().upper()
+    clean = raw_ticker.strip().upper().replace("[", "").replace("]", "")
+    
+    # 2. If EDGAR gave us BPRE directly, accept it
+    if clean == "BPRE":
+        return "BPRE"
+        
     if clean in ["NONE", "NULL", "N/A", "UNKNOWN", "UNKNO", "[NONE]", "BLACK", "VISTA"]:
         return None
         
@@ -33,7 +38,7 @@ def is_valid_ticker(raw_ticker, issuer_name):
 
 def get_sector_for_ticker(ticker):
     """Fetch the market sector or fund type for a given ticker using yfinance."""
-    if not ticker or ticker in ["UNKNOWN", "UNKNO", "NONE"]:
+    if ticker in ["BPRE", "MXF"]:
         return "Funds & ETFs"
         
     cleaned_ticker = ticker.replace(".", "-")
@@ -45,10 +50,10 @@ def get_sector_for_ticker(ticker):
             return sector
             
         quote_type = info.get("quoteType", "").upper()
-        if quote_type == "ETF" or quote_type == "MUTUALFUND":
+        if quote_type in ["ETF", "MUTUALFUND"]:
             return "Funds & ETFs"
             
-        return "Funds & ETFs" if ticker in ["BPRE", "MXF"] else "Unclassified"
+        return "Unclassified"
     except Exception:
         return "Funds & ETFs"
 
@@ -91,10 +96,10 @@ def generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
         return random.choice(fresh_phrases)
 
 def run_market_wide_etl():
-    print("Fetching recent Form 4 filings with 3-day optimization...")
+    print("Fetching recent Form 4 filings with fund-aware ticker resolution...")
     
-    # Optimized to 3 days for faster daily cron execution while preserving history
-    start_date = (datetime.date.today() - datetime.timedelta(days=3)).strftime('%Y-%m-%d')
+    # 5-day window balances speed with weekend/delayed filing coverage
+    start_date = (datetime.date.today() - datetime.timedelta(days=5)).strftime('%Y-%m-%d')
     filings = get_filings(form="4", filing_date=f"{start_date}:")
     
     parsed_transactions = []
@@ -133,8 +138,11 @@ def run_market_wide_etl():
             issuer_name_elem = root.find(".//issuer/issuerName")
             issuer_name = issuer_name_elem.text.strip() if (issuer_name_elem is not None and issuer_name_elem.text) else ""
 
-            # Resolve ticker with fund awareness
-            ticker = is_valid_ticker(raw_ticker, issuer_name)
+            issuer_cik_elem = root.find(".//issuer/issuerCik")
+            issuer_cik = issuer_cik_elem.text.strip() if (issuer_cik_elem is not None and issuer_cik_elem.text) else ""
+
+            # Resolve ticker with fund awareness and CIK backup
+            ticker = is_valid_ticker(raw_ticker, issuer_name, issuer_cik)
             if not ticker:
                 continue
 
@@ -209,7 +217,7 @@ def run_market_wide_etl():
     conn.commit()
     cursor.close()
     conn.close()
-    print("ETL sync completed successfully with optimized window!")
+    print("ETL sync completed successfully!")
 
 if __name__ == "__main__":
     run_market_wide_etl()
