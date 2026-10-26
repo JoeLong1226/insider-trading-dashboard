@@ -84,6 +84,12 @@ try:
         df['Shares Bought'] = df['shares_bought'].apply(lambda x: f"+{x:,.0f}")
         df['Est. Value ($)'] = df['est_value'].apply(lambda x: f"${x:,.0f}")
 
+        # Mask unlisted private credit and fund allocations to display clean text instead of $0 / 0.0%
+        institutional_sectors = ['Private Credit & Funds', 'Funds & ETFs', 'Mutual Funds', 'Unclassified']
+        fund_mask = df['sector'].isin(institutional_sectors)
+        df.loc[fund_mask, 'Unrealized Gain'] = "Institutional Allocation"
+        df.loc[fund_mask, 'Total Return'] = "N/A"
+
         # Metrics overview row
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Total Trades Tracked", len(df))
