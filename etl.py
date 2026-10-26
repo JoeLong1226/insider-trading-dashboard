@@ -26,14 +26,16 @@ def get_sector_for_ticker(ticker):
     except Exception:
         return "Unclassified"
 
-def generate_engaging_summary(cursor, insider, ticker, shares, est_val):
-    """Generate a dynamic, multi-factor narrative executive takeaway."""
-    # Check historical context for this insider/ticker combo in database
+def generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date):
+    """Generate a dynamic, multi-factor narrative executive takeaway strictly anchored to prior history."""
+    # Check if this insider bought this ticker on an EARLIER date in our database
     cursor.execute("""
-        SELECT COUNT(*), SUM(est_value) 
+        SELECT COUNT(*) 
         FROM insider_trades 
-        WHERE insider_name = %s AND ticker = %s
-    """, (insider, ticker))
+        WHERE insider_name = %s 
+          AND ticker = %s 
+          AND transaction_date < %s
+    """, (insider, ticker, tx_date))
     res = cursor.fetchone()
     prior_count = res[0] if res else 0
     
@@ -49,16 +51,16 @@ def generate_engaging_summary(cursor, insider, ticker, shares, est_val):
 
     # Pool of dynamic variations for repeat buyers
     repeat_phrases = [
-        f"{insider} deepens their conviction in {ticker}, acquiring another +{int(shares):,} shares ({scale_label}) in their ongoing accumulation phase.",
+        f"{insider} deepens their conviction in {ticker}, acquiring another +{int(shares):,} shares ({scale_label}) in an ongoing accumulation phase.",
         f"Continuing a pattern of insider buying, {insider} steps up for another round in {ticker}, picking up +{int(shares):,} shares ({scale_label}).",
         f"{insider} adds further weight to their position in {ticker}, securing +{int(shares):,} shares ({scale_label}) in a follow-on transaction."
     ]
 
     # Pool of dynamic variations for fresh position initiations
     fresh_phrases = [
-        f"{insider} steps onto the playing field in {ticker}, establishing a fresh position of +{int(shares):,} shares ({scale_label}).",
+        f"{insider} establishes a fresh position in {ticker}, picking up +{int(shares):,} shares ({scale_label}).",
         f"Marking a new stake in {ticker}, {insider} acquires +{int(shares):,} shares via {scale_label}.",
-        f"{insider} initiates coverage from the inside out, buying +{int(shares):,} shares of {ticker} ({scale_label})."
+        f"{insider} initiates coverage from the inside, buying +{int(shares):,} shares of {ticker} ({scale_label})."
     ]
 
     if prior_count > 0:
@@ -67,14 +69,14 @@ def generate_engaging_summary(cursor, insider, ticker, shares, est_val):
         return random.choice(fresh_phrases)
 
 def run_market_wide_etl():
-    print("Fetching recent Form 4 filings market-wide (deep historical scan with narrative engine)...")
+    print("Fetching recent Form 4 filings market-wide (deep historical scan with narrative & sector engine)...")
     
     filings = get_filings(form="4")
     recent_filings = filings.head(1000)
     
     parsed_transactions = []
 
-    # Connect to Supabase PostgreSQL early so we can check transaction context during parsing
+    # Connect to Supabase PostgreSQL early to check historical context during parsing
     conn_url = os.environ.get("SUPABASE_DB_URL")
     conn = psycopg2.connect(conn_url)
     cursor = conn.cursor()
@@ -128,8 +130,8 @@ def run_market_wide_etl():
                 if est_val >= 50000 and shares > 0:
                     sector = get_sector_for_ticker(ticker)
                     
-                    # Generate dynamic narrative takeaway
-                    ai_summary = generate_engaging_summary(cursor, insider, ticker, shares, est_val)
+                    # Generate strict history-aware narrative takeaway
+                    ai_summary = generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
 
                     parsed_transactions.append({
                         "transaction_date": tx_date,
@@ -153,7 +155,7 @@ def run_market_wide_etl():
         conn.close()
         return
 
-    print(f"Extracted {len(df_new)} high-conviction trades with narrative summaries. Upserting into Supabase...")
+    print(f"Extracted {len(df_new)} high-conviction trades. Upserting into Supabase...")
 
     for _, row in df_new.iterrows():
         cursor.execute("""
@@ -179,7 +181,7 @@ def run_market_wide_etl():
     conn.commit()
     cursor.close()
     conn.close()
-    print("ETL sync with narrative enhancements completed successfully!")
+    print("ETL complete with full sector mapping and narrative upgrades!")
 
 if __name__ == "__main__":
     run_market_wide_etl()
