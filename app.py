@@ -80,7 +80,7 @@ try:
 
         # Format column values for executive table display
         df['Unrealized Gain'] = df['Unrealized Profit ($)'].apply(lambda x: f"+${x:,.0f}" if x >= 0 else f"-${abs(x):,.0f}")
-        df['Total Return'] = df['Return (%)'].apply(lambda x: f"+{x:.1f}%" if x:.1f}%" if x >= 0 else f"{x:.1f}%")
+        df['Total Return'] = df['Return (%)'].apply(lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%")
         df['Shares Bought'] = df['shares_bought'].apply(lambda x: f"+{x:,.0f}")
         df['Est. Value ($)'] = df['est_value'].apply(lambda x: f"${x:,.0f}")
 
