@@ -1,5 +1,6 @@
 import os
 import re
+import datetime
 import xml.etree.ElementTree as ET
 import pandas as pd
 from edgar import get_filings, set_identity
@@ -12,7 +13,7 @@ set_identity("JosephLong1226@gmail.com")
 
 def get_sector_for_ticker(ticker):
     """Fetch the market sector or fund type for a given ticker using yfinance."""
-    if not ticker or ticker == "UNKNOWN":
+    if not ticker or ticker in ["UNKNOWN", "UNKNO", "NONE"]:
         return "Unclassified"
         
     cleaned_ticker = ticker.replace(".", "-")
@@ -76,10 +77,11 @@ def generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
         return random.choice(fresh_phrases)
 
 def run_market_wide_etl():
-    print("Fetching recent Form 4 filings market-wide with robust issuer resolution...")
+    print("Fetching recent Form 4 filings by date range to ensure complete coverage...")
     
-    filings = get_filings(form="4")
-    recent_filings = filings.head(1000)
+    # Fetch filings from the last 10 days to guarantee no missed trades (like BPRE)
+    start_date = (datetime.date.today() - datetime.timedelta(days=10)).strftime('%Y-%m-%d')
+    filings = get_filings(form="4", date_since=start_date)
     
     parsed_transactions = []
 
@@ -103,7 +105,7 @@ def run_market_wide_etl():
         );
     """)
 
-    for filing in recent_filings:
+    for filing in filings:
         try:
             xml_content = filing.xml()
             if not xml_content:
@@ -111,20 +113,23 @@ def run_market_wide_etl():
 
             root = ET.fromstring(xml_content)
 
-            # Extract ticker and issuer name elements
             issuer_ticker_elem = root.find(".//issuer/issuerTradingSymbol")
             raw_ticker = issuer_ticker_elem.text.strip().upper() if issuer_ticker_elem is not None and issuer_ticker_elem.text else ""
             
             issuer_name_elem = root.find(".//issuer/issuerName")
             issuer_name = issuer_name_elem.text.strip() if issuer_name_elem is not None and issuer_name_elem.text else ""
 
-            # Resolve ticker: use raw ticker if valid, otherwise fallback to cleaning the issuer name
+            # Resolve ticker cleanly
             if raw_ticker and raw_ticker not in ["", "NONE", "NULL", "N/A", "UNKNOWN", "UNKNO", "[NONE]"]:
                 ticker = raw_ticker.replace("[", "").replace("]", "").strip().upper()
             else:
-                cleaned_name = re.sub(r'\b(INC|CORP|LLC|L P|LP|CO|COMPANY|HOLDINGS)\b', '', issuer_name.upper())
-                parts = cleaned_name.split()
-                ticker = parts[0][:5] if parts else "UNKNOWN"
+                # Handle specific known funds or clean issuer name
+                if "BLACKSTONE" in issuer_name.upper():
+                    ticker = "BX" # Default public ticker for Blackstone entities if omitted
+                else:
+                    cleaned_name = re.sub(r'\b(INC|CORP|LLC|L P|LP|CO|COMPANY|HOLDINGS|FUND)\b', '', issuer_name.upper())
+                    parts = cleaned_name.split()
+                    ticker = parts[0][:5] if parts else "UNKNOWN"
 
             rpt_owner_elem = root.find(".//reportingOwner/reportingOwnerId/rptOwnerName")
             insider = rpt_owner_elem.text if rpt_owner_elem is not None and rpt_owner_elem.text else "Insider Trader"
@@ -197,7 +202,7 @@ def run_market_wide_etl():
     conn.commit()
     cursor.close()
     conn.close()
-    print("ETL sync completed successfully with intelligent issuer resolution!")
+    print("ETL sync completed with date-range coverage and ticker resolution!")
 
 if __name__ == "__main__":
     run_market_wide_etl()
