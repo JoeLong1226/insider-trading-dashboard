@@ -11,7 +11,7 @@ set_identity("JosephLong1226@gmail.com")
 
 def get_sector_for_ticker(ticker):
     """Fetch the market sector for a given ticker using yfinance with fallback cleaning."""
-    if not ticker or ticker in ["UNKNOWN", "NONE", "N/A"]:
+    if not ticker or ticker in ["UNKNOWN", "NONE", "NULL", "N/A"]:
         return "Unclassified"
     
     cleaned_ticker = ticker.replace(".", "-")
@@ -69,7 +69,7 @@ def generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
         return random.choice(fresh_phrases)
 
 def run_market_wide_etl():
-    print("Fetching recent Form 4 filings market-wide (deep historical scan with narrative & sector engine)...")
+    print("Fetching recent Form 4 filings market-wide (deep historical scan with ticker validation)...")
     
     filings = get_filings(form="4")
     recent_filings = filings.head(1000)
@@ -106,8 +106,14 @@ def run_market_wide_etl():
 
             root = ET.fromstring(xml_content)
 
+            # Safely extract and clean Ticker Symbol (handling NONE, NULL, empty values)
             issuer_ticker_elem = root.find(".//issuer/issuerTradingSymbol")
-            ticker = issuer_ticker_elem.text.upper() if issuer_ticker_elem is not None and issuer_ticker_elem.text else "UNKNOWN"
+            raw_ticker = issuer_ticker_elem.text.strip().upper() if issuer_ticker_elem is not None and issuer_ticker_elem.text else ""
+            
+            if raw_ticker in ["", "NONE", "NULL", "N/A", "UNKNOWN"]:
+                ticker = "UNKNOWN"
+            else:
+                ticker = raw_ticker
 
             rpt_owner_elem = root.find(".//reportingOwner/reportingOwnerId/rptOwnerName")
             insider = rpt_owner_elem.text if rpt_owner_elem is not None and rpt_owner_elem.text else "Insider Trader"
@@ -181,7 +187,7 @@ def run_market_wide_etl():
     conn.commit()
     cursor.close()
     conn.close()
-    print("ETL complete with full sector mapping and narrative upgrades!")
+    print("ETL complete with ticker validation, sector mapping, and narrative upgrades!")
 
 if __name__ == "__main__":
     run_market_wide_etl()
