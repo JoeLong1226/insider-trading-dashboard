@@ -2,3 +2,5 @@ streamlit
 psycopg2-binary
 pandas
 streamlit-autorefresh
+edgartools
+yfinance
