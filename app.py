@@ -39,7 +39,7 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value):
         return 0.0, 0.0
 
 def apply_high_conviction_flags(df):
-    """Evaluates multi-insider clusters over a 60-day window, C-suite titles, and position size increases safely."""
+    """Evaluates multi-insider clusters, C-suite accumulation, and verified skin-in-the-game."""
     df['parsed_date'] = pd.to_datetime(df['transaction_date'])
     flags = []
 
@@ -49,19 +49,18 @@ def apply_high_conviction_flags(df):
         insider = row['insider_name']
         title = str(row['insider_title'] or "").upper()
         
-        # Safely convert numeric fields, defaulting to 0 if None/NaN
         shares_bought = float(row['shares_bought']) if pd.notnull(row['shares_bought']) else 0.0
         shares_following = float(row['shares_owned_following']) if pd.notnull(row['shares_owned_following']) else 0.0
         est_val = float(row['est_value']) if pd.notnull(row['est_value']) else 0.0
 
-        # Calculate position percentage increase
+        # Calculate position percentage increase strictly when prior shares are known and > 0
         prior_shares = shares_following - shares_bought
-        if prior_shares <= 0 or shares_following == 0:
-            position_increase_pct = 100.0  # Brand new position setup or missing data
-        else:
+        if prior_shares > 0 and shares_bought > 0:
             position_increase_pct = (shares_bought / prior_shares) * 100.0
+        else:
+            position_increase_pct = 0.0
 
-        # Expanded 60-Day Lookback Window
+        # Expanded Lookback Window for Clusters
         window_df = df[
             (df['ticker'] == ticker) & 
             (df['parsed_date'] >= current_date - pd.Timedelta(days=60)) & 
@@ -73,7 +72,7 @@ def apply_high_conviction_flags(df):
 
         is_csuite = any(t in title for t in ["CEO", "CHIEF EXECUTIVE", "CFO", "CHAIRMAN", "PRESIDENT"])
 
-        # Prioritization rules
+        # Strict Prioritization Rules (Default to Standard Purchase)
         if unique_insiders >= 2:
             flags.append("🔥 Multi-Insider Cluster (60d)")
         elif is_csuite and repeat_buys_by_insider >= 2:
