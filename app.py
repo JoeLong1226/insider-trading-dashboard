@@ -15,7 +15,6 @@ def get_db_connection():
 # Helper function to compute unrealized profit including dividends with ticker guards
 @st.cache_data(ttl=3600)
 def calculate_trade_performance(ticker, tx_date_str, shares, est_value):
-    # Guard against invalid or missing tickers
     if not ticker or ticker.upper() in ["UNKNOWN", "NONE", "NULL", "N/A"] or shares <= 0:
         return 0.0, 0.0
 
@@ -25,7 +24,6 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value):
         stock = yf.Ticker(cleaned_ticker)
         tx_date = pd.to_datetime(tx_date_str).tz_localize(None)
         
-        # Fetch current price robustly
         current_price = stock.fast_info.get('lastPrice') or stock.info.get('currentPrice')
         
         hist = stock.history(start=tx_date_str)
@@ -62,7 +60,7 @@ st.write("Market-wide tracking of high-conviction open-market executive purchase
 try:
     conn = get_db_connection()
     query = """
-        SELECT transaction_date, ticker, sector, insider_name, shares_bought, est_value, activity_type, ai_summary 
+        SELECT transaction_date, ticker, sector, insider_name, shares_bought, est_value, activity_type 
         FROM insider_trades 
         ORDER BY transaction_date DESC;
     """
@@ -84,7 +82,7 @@ try:
         df['Shares Bought'] = df['shares_bought'].apply(lambda x: f"+{x:,.0f}")
         df['Est. Value ($)'] = df['est_value'].apply(lambda x: f"${x:,.0f}")
 
-        # Mask unlisted private credit and fund allocations to display clean text instead of $0 / 0.0%
+        # Mask unlisted private credit and fund allocations
         institutional_sectors = ['Private Credit & Funds', 'Funds & ETFs', 'Mutual Funds', 'Unclassified']
         fund_mask = df['sector'].isin(institutional_sectors)
         df.loc[fund_mask, 'Unrealized Gain'] = "Institutional Allocation"
@@ -103,12 +101,12 @@ try:
         # Select & reorder columns for final display
         display_df = df[[
             "transaction_date", "ticker", "sector", "insider_name", 
-            "Shares Bought", "Est. Value ($)", "Unrealized Gain", "Total Return", "ai_summary"
+            "Shares Bought", "Est. Value ($)", "Unrealized Gain", "Total Return"
         ]]
 
         display_df.columns = [
             "Transaction Date", "Ticker", "Sector", "Insider Name", 
-            "Shares Bought", "Est. Value ($)", "Unrealized Gain (Inc. Divs)", "Total Return", "AI Executive Takeaway"
+            "Shares Bought", "Est. Value ($)", "Unrealized Gain (Inc. Divs)", "Total Return"
         ]
 
         st.dataframe(display_df, use_container_width=True)
