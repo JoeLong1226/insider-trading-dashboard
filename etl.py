@@ -2,13 +2,32 @@ import os
 import xml.etree.ElementTree as ET
 import pandas as pd
 from edgar import get_filings, set_identity
+import yfinance as yf
 import psycopg2
 
 # Set required SEC EDGAR identity
 set_identity("JosephLong1226@gmail.com")
 
+def get_sector_for_ticker(ticker):
+    """Fetch the market sector for a given ticker using yfinance with fallback cleaning."""
+    if not ticker or ticker in ["UNKNOWN", "NONE", "N/A"]:
+        return "Unclassified"
+    
+    # Clean up common ticker formatting issues (e.g., dots to hyphens for share classes like BRK.B)
+    cleaned_ticker = ticker.replace(".", "-")
+    
+    try:
+        stock = yf.Ticker(cleaned_ticker)
+        info = stock.info
+        sector = info.get("sector")
+        if sector:
+            return sector
+        return "Unclassified"
+    except Exception:
+        return "Unclassified"
+
 def run_market_wide_etl():
-    print("Fetching recent Form 4 filings market-wide (deep historical scan)...")
+    print("Fetching recent Form 4 filings market-wide (deep historical scan with sectors)...")
     
     # Fetch a larger batch of Form 4 filings from SEC EDGAR feed (1,000 filings)
     filings = get_filings(form="4")
@@ -50,10 +69,13 @@ def run_market_wide_etl():
 
                 # Filter for transactions over $50,000
                 if est_val >= 50000 and shares > 0:
+                    # Dynamically look up sector using yfinance
+                    sector = get_sector_for_ticker(ticker)
+                    
                     parsed_transactions.append({
                         "transaction_date": tx_date,
                         "ticker": ticker,
-                        "sector": "Unclassified",
+                        "sector": sector,
                         "insider_name": insider,
                         "shares_bought": int(shares),
                         "est_value": float(est_val),
@@ -71,7 +93,7 @@ def run_market_wide_etl():
         print("No open-market purchases over $50k found in this batch.")
         return
 
-    print(f"Extracted {len(df_new)} high-conviction trades from deep scan. Connecting to Supabase...")
+    print(f"Extracted {len(df_new)} high-conviction trades with sector data. Connecting to Supabase...")
 
     # Connect to Supabase PostgreSQL and Upsert
     conn_url = os.environ.get("SUPABASE_DB_URL")
@@ -99,7 +121,8 @@ def run_market_wide_etl():
         cursor.execute("""
             INSERT INTO insider_trades (transaction_date, ticker, sector, insider_name, shares_bought, est_value, activity_type, ai_summary)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING;
+            ON CONFLICT (transaction_date, ticker, insider_name, shares_bought, est_value) 
+            DO UPDATE SET sector = EXCLUDED.sector WHERE insider_trades.sector = 'Unclassified';
         """, (
             row["transaction_date"],
             row["ticker"],
@@ -114,7 +137,7 @@ def run_market_wide_etl():
     conn.commit()
     cursor.close()
     conn.close()
-    print("ETL deep historical sync completed successfully!")
+    print("ETL sector-enrichment sync completed successfully!")
 
 if __name__ == "__main__":
     run_market_wide_etl()
