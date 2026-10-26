@@ -11,22 +11,37 @@ import random
 # Set required SEC EDGAR identity
 set_identity("JosephLong1226@gmail.com")
 
-# Explicit mapping for known private credit/interval funds missing XML exchange symbols
+# Explicit mapping for known CIKs (both padded and unpadded string keys handled)
 FUND_CIK_MAP = {
-    "0002049733": "BREC",   # Blackstone Private Real Estate Credit & Income Fund
-    "0001851212": "BPRE",   # Bluerock Private Real Estate Fund
-    "0001560385": "BPRE",   # Bluerock Alternative Growth
-    "0001833538": "BCRED",  # Blackstone Private Credit Fund
-    "0001835567": "BMACX",  # Blackstone Private Multi-Asset Credit & Income
+    # Blackstone Private Real Estate Credit & Income Fund
+    "2049733": "BREC",
+    "0002049733": "BREC",
+    # Bluerock Private Real Estate Fund
+    "1551047": "BPRE",
+    "0001551047": "BPRE",
+    "1851212": "BPRE",
+    "0001851212": "BPRE",
+    "1560385": "BPRE",
+    "0001560385": "BPRE",
+    # Blackstone Private Credit Fund
+    "1833538": "BCRED",
+    "0001833538": "BCRED",
+    # Blackstone Private Multi-Asset Credit & Income
+    "2032432": "BMACX",
+    "0002032432": "BMACX",
 }
 
 def resolve_ticker(raw_ticker, issuer_name, issuer_cik=""):
     """Resolve standard exchange tickers or map known CIK/fund entities."""
-    # 1. Primary Check: Direct SEC CIK mapping for unlisted interval/credit funds
+    clean_cik = str(issuer_cik).strip().lstrip("0")
+    
+    # 1. Primary Check: Direct CIK match (unpadded)
+    if clean_cik in FUND_CIK_MAP:
+        return FUND_CIK_MAP[clean_cik]
     if issuer_cik in FUND_CIK_MAP:
         return FUND_CIK_MAP[issuer_cik]
 
-    # 2. Secondary Check: Name-based overrides for closed-end real estate funds
+    # 2. Secondary Check: Name-based overrides
     name_upper = issuer_name.upper()
     if "BLUEROCK" in name_upper or "BLUROCK" in name_upper:
         return "BPRE"
@@ -42,7 +57,7 @@ def resolve_ticker(raw_ticker, issuer_name, issuer_cik=""):
     if clean in ["NONE", "NULL", "N/A", "UNKNOWN", "UNKNO", "BLACK", "VISTA"]:
         return None
 
-    if bool(re.match(r"^[A-Z0-9.\-]+$", clean)) and len(clean) <= 6:
+    if bool(re.match(r"^[A-Z0-9.\-]+\$", clean)) and len(clean) <= 6:
         return clean
 
     return None
@@ -81,13 +96,13 @@ def generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
     prior_count = res[0] if res else 0
 
     if est_val >= 5000000:
-        scale_label = f"a massive, multi-million dollar block worth ${est_val:,.0f}"
+        scale_label = f"a massive, multi-million dollar block worth \${est_val:,.0f}"
     elif est_val >= 1000000:
-        scale_label = f"a heavy seven-figure commitment totaling ${est_val:,.0f}"
+        scale_label = f"a heavy seven-figure commitment totaling \${est_val:,.0f}"
     elif est_val >= 250000:
-        scale_label = f"a substantial ${est_val:,.0f} position"
+        scale_label = f"a substantial \${est_val:,.0f} position"
     else:
-        scale_label = f"an open-market transaction valued at ${est_val:,.0f}"
+        scale_label = f"an open-market transaction valued at \${est_val:,.0f}"
 
     repeat_phrases = [
         f"{insider} deepens conviction in {ticker}, acquiring another +{int(shares):,} shares ({scale_label}).",
@@ -104,12 +119,11 @@ def generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
     return random.choice(repeat_phrases) if prior_count > 0 else random.choice(fresh_phrases)
 
 def run_market_wide_etl():
-    print("Fetching recent Form 4 filings with CIK fund resolution...")
+    # Expanded to 7 days for full weekend / late filing coverage
+    start_date = (datetime.date.today() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')
+    print(f"Fetching recent Form 4 filings from {start_date} with CIK fund resolution...")
 
-    # 5-day window balances speed with delayed filing coverage
-    start_date = (datetime.date.today() - datetime.timedelta(days=5)).strftime('%Y-%m-%d')
     filings = get_filings(form="4", filing_date=f"{start_date}:")
-
     parsed_transactions = []
 
     conn_url = os.environ.get("SUPABASE_DB_URL")
@@ -147,84 +161,4 @@ def run_market_wide_etl():
             issuer_name = issuer_name_elem.text.strip() if (issuer_name_elem is not None and issuer_name_elem.text) else ""
 
             issuer_cik_elem = root.find(".//issuer/issuerCik")
-            issuer_cik = issuer_cik_elem.text.strip() if (issuer_cik_elem is not None and issuer_cik_elem.text) else ""
-
-            # Resolve ticker using CIK lookup first, then standard ticker validation
-            ticker = resolve_ticker(raw_ticker, issuer_name, issuer_cik)
-            if not ticker:
-                continue
-
-            rpt_owner_elem = root.find(".//reportingOwner/reportingOwnerId/rptOwnerName")
-            insider = rpt_owner_elem.text if (rpt_owner_elem is not None and rpt_owner_elem.text) else "Insider Trader"
-
-            for tx in root.findall(".//nonDerivativeTransaction"):
-                code_elem = tx.find(".//transactionCoding/transactionCode")
-                if code_elem is None or code_elem.text != "P":
-                    continue
-
-                shares_elem = tx.find(".//transactionAmounts/transactionShares/value")
-                price_elem = tx.find(".//transactionAmounts/transactionPricePerShare/value")
-                date_elem = tx.find(".//transactionDate/value")
-
-                shares = float(shares_elem.text) if (shares_elem is not None and shares_elem.text) else 0.0
-                price = float(price_elem.text) if (price_elem is not None and price_elem.text) else 0.0
-                tx_date = date_elem.text if (date_elem is not None and date_elem.text) else str(filing.filing_date)
-
-                est_val = shares * price
-
-                if est_val >= 50000 and shares > 0:
-                    sector = get_sector_for_ticker(ticker)
-                    ai_summary = generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
-
-                    parsed_transactions.append({
-                        "transaction_date": tx_date,
-                        "ticker": ticker,
-                        "sector": sector,
-                        "insider_name": insider,
-                        "shares_bought": int(shares),
-                        "est_value": float(est_val),
-                        "activity_type": "Purchase",
-                        "ai_summary": ai_summary
-                    })
-
-        except Exception:
-            continue
-
-    df_new = pd.DataFrame(parsed_transactions)
-
-    if df_new.empty:
-        print("No valid open-market purchases over $50k found in this batch.")
-        cursor.close()
-        conn.close()
-        return
-
-    print(f"Extracted {len(df_new)} validated trades. Upserting into Supabase...")
-
-    for _, row in df_new.iterrows():
-        cursor.execute("""
-            INSERT INTO insider_trades (transaction_date, ticker, sector, insider_name, shares_bought, est_value, activity_type, ai_summary)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (transaction_date, ticker, insider_name, shares_bought, est_value) 
-            DO UPDATE SET 
-                sector = EXCLUDED.sector,
-                ai_summary = EXCLUDED.ai_summary
-            WHERE insider_trades.sector = 'Unclassified' 
-               OR insider_trades.ai_summary LIKE '%%acquired%%via open-market purchase%%';
-        """, (
-            row["transaction_date"],
-            row["ticker"],
-            row["sector"],
-            row["insider_name"],
-            row["shares_bought"],
-            row["est_value"],
-            row["activity_type"],
-            row["ai_summary"]
-        ))
-
-    conn.commit()
-    cursor.close()
-    conn.close()
-    print("ETL sync completed successfully with CIK fund resolution!")
-
-if __name__ == "__main__":
-    run_market_wide_etl()
+            issuer_cik = issuer_cik_elem.text.strip
