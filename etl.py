@@ -81,7 +81,7 @@ def run_market_wide_etl():
     
     # Fetch filings from the last 10 days to guarantee no missed trades (like BPRE)
     start_date = (datetime.date.today() - datetime.timedelta(days=10)).strftime('%Y-%m-%d')
-    filings = get_filings(form="4", date_since=start_date)
+    filings = get_filings(form="4", filing_date=f"{start_date}:")
     
     parsed_transactions = []
 
