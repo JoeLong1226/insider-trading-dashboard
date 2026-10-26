@@ -11,10 +11,30 @@ import random
 # Set required SEC EDGAR identity
 set_identity("JosephLong1226@gmail.com")
 
+def is_valid_ticker(raw_ticker, issuer_name):
+    """Ensure the ticker is valid, or explicitly map known closed-end funds missing their XML ticker."""
+    name_upper = issuer_name.upper()
+    
+    # Explicit mapping for known funds that omit or misformat their trading symbol in Form 4 XMLs
+    if "BLUROCK" in name_upper or "BLUEROCK" in name_upper:
+        return "BPRE"
+        
+    if not raw_ticker or not isinstance(raw_ticker, str):
+        return None
+        
+    clean = raw_ticker.strip().upper()
+    if clean in ["NONE", "NULL", "N/A", "UNKNOWN", "UNKNO", "[NONE]", "BLACK", "VISTA"]:
+        return None
+        
+    if bool(re.match(r"^[A-Z0-9.\-]+\$", clean)) and len(clean) <= 6:
+        return clean
+        
+    return None
+
 def get_sector_for_ticker(ticker):
     """Fetch the market sector or fund type for a given ticker using yfinance."""
     if not ticker or ticker in ["UNKNOWN", "UNKNO", "NONE"]:
-        return "Unclassified"
+        return "Funds & ETFs"
         
     cleaned_ticker = ticker.replace(".", "-")
     try:
@@ -25,18 +45,12 @@ def get_sector_for_ticker(ticker):
             return sector
             
         quote_type = info.get("quoteType", "").upper()
-        if quote_type == "ETF":
-            return "Funds & ETFs"
-        elif quote_type == "MUTUALFUND":
-            return "Mutual Funds"
-        elif ticker.endswith("X") or len(ticker) == 5:
+        if quote_type == "ETF" or quote_type == "MUTUALFUND":
             return "Funds & ETFs"
             
-        return "Unclassified"
+        return "Funds & ETFs" if ticker in ["BPRE", "MXF"] else "Unclassified"
     except Exception:
-        if ticker.endswith("X"):
-            return "Funds & ETFs"
-        return "Unclassified"
+        return "Funds & ETFs"
 
 def generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date):
     """Generate a dynamic narrative executive takeaway strictly anchored to prior history."""
@@ -51,13 +65,13 @@ def generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
     prior_count = res[0] if res else 0
     
     if est_val >= 5000000:
-        scale_label = f"a massive, multi-million dollar block worth ${est_val:,.0f}"
+        scale_label = f"a massive, multi-million dollar block worth \${est_val:,.0f}"
     elif est_val >= 1000000:
-        scale_label = f"a heavy seven-figure commitment totaling ${est_val:,.0f}"
+        scale_label = f"a heavy seven-figure commitment totaling \${est_val:,.0f}"
     elif est_val >= 250000:
-        scale_label = f"a substantial ${est_val:,.0f} open-market stake"
+        scale_label = f"a substantial \${est_val:,.0f} open-market stake"
     else:
-        scale_label = f"an open-market purchase valued at ${est_val:,.0f}"
+        scale_label = f"an open-market purchase valued at \${est_val:,.0f}"
 
     repeat_phrases = [
         f"{insider} deepens their conviction in {ticker}, acquiring another +{int(shares):,} shares ({scale_label}) in an ongoing accumulation phase.",
@@ -77,10 +91,10 @@ def generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
         return random.choice(fresh_phrases)
 
 def run_market_wide_etl():
-    print("Fetching recent Form 4 filings by date range to ensure complete coverage...")
+    print("Fetching recent Form 4 filings with 3-day optimization...")
     
-    # Fetch filings from the last 10 days up to today
-    start_date = (datetime.date.today() - datetime.timedelta(days=10)).strftime('%Y-%m-%d')
+    # Optimized to 3 days for faster daily cron execution while preserving history
+    start_date = (datetime.date.today() - datetime.timedelta(days=3)).strftime('%Y-%m-%d')
     filings = get_filings(form="4", filing_date=f"{start_date}:")
     
     parsed_transactions = []
@@ -119,16 +133,10 @@ def run_market_wide_etl():
             issuer_name_elem = root.find(".//issuer/issuerName")
             issuer_name = issuer_name_elem.text.strip() if (issuer_name_elem is not None and issuer_name_elem.text) else ""
 
-            # Resolve ticker cleanly with standard if/else syntax
-            if raw_ticker and raw_ticker not in ["", "NONE", "NULL", "N/A", "UNKNOWN", "UNKNO", "[NONE]"]:
-                ticker = raw_ticker.replace("[", "").replace("]", "").strip().upper()
-            else:
-                if "BLACKSTONE" in issuer_name.upper():
-                    ticker = "BX"
-                else:
-                    cleaned_name = re.sub(r'\b(INC|CORP|LLC|L P|LP|CO|COMPANY|HOLDINGS|FUND)\b', '', issuer_name.upper())
-                    parts = cleaned_name.split()
-                    ticker = parts[0][:5] if parts else "UNKNOWN"
+            # Resolve ticker with fund awareness
+            ticker = is_valid_ticker(raw_ticker, issuer_name)
+            if not ticker:
+                continue
 
             rpt_owner_elem = root.find(".//reportingOwner/reportingOwnerId/rptOwnerName")
             insider = rpt_owner_elem.text if (rpt_owner_elem is not None and rpt_owner_elem.text) else "Insider Trader"
@@ -148,7 +156,7 @@ def run_market_wide_etl():
 
                 est_val = shares * price
 
-                if est_val >= 50000 and shares > 0 and ticker != "UNKNOWN":
+                if est_val >= 50000 and shares > 0:
                     sector = get_sector_for_ticker(ticker)
                     
                     ai_summary = generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
@@ -170,12 +178,12 @@ def run_market_wide_etl():
     df_new = pd.DataFrame(parsed_transactions)
     
     if df_new.empty:
-        print("No valid open-market purchases over $50k found in this batch.")
+        print("No valid open-market purchases over \$50k found in this batch.")
         cursor.close()
         conn.close()
         return
 
-    print(f"Extracted {len(df_new)} trades. Upserting into Supabase...")
+    print(f"Extracted {len(df_new)} validated trades. Upserting into Supabase...")
 
     for _, row in df_new.iterrows():
         cursor.execute("""
@@ -195,13 +203,3 @@ def run_market_wide_etl():
             row["shares_bought"],
             row["est_value"],
             row["activity_type"],
-            row["ai_summary"]
-        ))
-
-    conn.commit()
-    cursor.close()
-    conn.close()
-    print("ETL sync completed successfully!")
-
-if __name__ == "__main__":
-    run_market_wide_etl()
