@@ -1,4 +1,5 @@
 import os
+import re
 import xml.etree.ElementTree as ET
 import pandas as pd
 from edgar import get_filings, set_identity
@@ -10,22 +11,18 @@ import random
 set_identity("JosephLong1226@gmail.com")
 
 def get_sector_for_ticker(ticker):
-    """Fetch the market sector or fund type for a given ticker using yfinance with intelligent fallbacks."""
-    if not ticker or ticker in ["UNKNOWN", "NONE", "NULL", "N/A"]:
+    """Fetch the market sector or fund type for a given ticker using yfinance."""
+    if not ticker or ticker == "UNKNOWN":
         return "Unclassified"
-    
+        
     cleaned_ticker = ticker.replace(".", "-")
-    
     try:
         stock = yf.Ticker(cleaned_ticker)
         info = stock.info
-        
-        # Check standard sector first
         sector = info.get("sector")
         if sector:
             return sector
             
-        # Fallback for ETFs, Mutual Funds, and Closed-End Funds that lack corporate sectors
         quote_type = info.get("quoteType", "").upper()
         if quote_type == "ETF":
             return "Funds & ETFs"
@@ -41,7 +38,7 @@ def get_sector_for_ticker(ticker):
         return "Unclassified"
 
 def generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date):
-    """Generate a dynamic, multi-factor narrative executive takeaway strictly anchored to prior history."""
+    """Generate a dynamic narrative executive takeaway strictly anchored to prior history."""
     cursor.execute("""
         SELECT COUNT(*) 
         FROM insider_trades 
@@ -79,7 +76,7 @@ def generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
         return random.choice(fresh_phrases)
 
 def run_market_wide_etl():
-    print("Fetching recent Form 4 filings market-wide (deep historical scan with advanced fund & ticker parsing)...")
+    print("Fetching recent Form 4 filings market-wide with robust issuer resolution...")
     
     filings = get_filings(form="4")
     recent_filings = filings.head(1000)
@@ -114,18 +111,20 @@ def run_market_wide_etl():
 
             root = ET.fromstring(xml_content)
 
-            # Extract Ticker with intelligent fallback to Issuer Name if ticker is NONE/missing
+            # Extract ticker and issuer name elements
             issuer_ticker_elem = root.find(".//issuer/issuerTradingSymbol")
             raw_ticker = issuer_ticker_elem.text.strip().upper() if issuer_ticker_elem is not None and issuer_ticker_elem.text else ""
             
             issuer_name_elem = root.find(".//issuer/issuerName")
-            issuer_name = issuer_name_elem.text.strip() if issuer_name_elem is not None and issuer_name_elem.text else "PRIVATE ENTITY"
+            issuer_name = issuer_name_elem.text.strip() if issuer_name_elem is not None and issuer_name_elem.text else ""
 
-            if raw_ticker in ["", "NONE", "NULL", "N/A", "UNKNOWN"]:
-                # Use a clean truncated version of the issuer name as identifier if no public ticker exists
-                ticker = issuer_name.split()[0].upper()[:10]
+            # Resolve ticker: use raw ticker if valid, otherwise fallback to cleaning the issuer name
+            if raw_ticker and raw_ticker not in ["", "NONE", "NULL", "N/A", "UNKNOWN", "UNKNO", "[NONE]"]:
+                ticker = raw_ticker.replace("[", "").replace("]", "").strip().upper()
             else:
-                ticker = raw_ticker
+                cleaned_name = re.sub(r'\b(INC|CORP|LLC|L P|LP|CO|COMPANY|HOLDINGS)\b', '', issuer_name.upper())
+                parts = cleaned_name.split()
+                ticker = parts[0][:5] if parts else "UNKNOWN"
 
             rpt_owner_elem = root.find(".//reportingOwner/reportingOwnerId/rptOwnerName")
             insider = rpt_owner_elem.text if rpt_owner_elem is not None and rpt_owner_elem.text else "Insider Trader"
@@ -145,7 +144,7 @@ def run_market_wide_etl():
 
                 est_val = shares * price
 
-                if est_val >= 50000 and shares > 0:
+                if est_val >= 50000 and shares > 0 and ticker != "UNKNOWN":
                     sector = get_sector_for_ticker(ticker)
                     
                     ai_summary = generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
@@ -167,12 +166,12 @@ def run_market_wide_etl():
     df_new = pd.DataFrame(parsed_transactions)
     
     if df_new.empty:
-        print("No open-market purchases over $50k found in this batch.")
+        print("No valid open-market purchases over $50k found in this batch.")
         cursor.close()
         conn.close()
         return
 
-    print(f"Extracted {len(df_new)} high-conviction trades. Upserting into Supabase...")
+    print(f"Extracted {len(df_new)} trades. Upserting into Supabase...")
 
     for _, row in df_new.iterrows():
         cursor.execute("""
@@ -198,7 +197,7 @@ def run_market_wide_etl():
     conn.commit()
     cursor.close()
     conn.close()
-    print("ETL complete with fund sector classification and entity fallback parsing!")
+    print("ETL sync completed successfully with intelligent issuer resolution!")
 
 if __name__ == "__main__":
     run_market_wide_etl()
