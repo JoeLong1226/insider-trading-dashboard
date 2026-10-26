@@ -39,7 +39,7 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value):
         return 0.0, 0.0
 
 def apply_high_conviction_flags(df):
-    """Evaluates multi-insider clusters over a 60-day window, C-suite titles, and position size increases."""
+    """Evaluates multi-insider clusters over a 60-day window, C-suite titles, and position size increases safely."""
     df['parsed_date'] = pd.to_datetime(df['transaction_date'])
     flags = []
 
@@ -47,14 +47,17 @@ def apply_high_conviction_flags(df):
         current_date = row['parsed_date']
         ticker = row['ticker']
         insider = row['insider_name']
-        title = str(row['insider_title']).upper()
-        shares_bought = float(row['shares_bought'])
-        shares_following = float(row['shares_owned_following'])
+        title = str(row['insider_title'] or "").upper()
+        
+        # Safely convert numeric fields, defaulting to 0 if None/NaN
+        shares_bought = float(row['shares_bought']) if pd.notnull(row['shares_bought']) else 0.0
+        shares_following = float(row['shares_owned_following']) if pd.notnull(row['shares_owned_following']) else 0.0
+        est_val = float(row['est_value']) if pd.notnull(row['est_value']) else 0.0
 
         # Calculate position percentage increase
         prior_shares = shares_following - shares_bought
-        if prior_shares <= 0:
-            position_increase_pct = 100.0  # Brand new position setup
+        if prior_shares <= 0 or shares_following == 0:
+            position_increase_pct = 100.0  # Brand new position setup or missing data
         else:
             position_increase_pct = (shares_bought / prior_shares) * 100.0
 
@@ -75,7 +78,7 @@ def apply_high_conviction_flags(df):
             flags.append("🔥 Multi-Insider Cluster (60d)")
         elif is_csuite and repeat_buys_by_insider >= 2:
             flags.append("⚡ C-Suite Accumulation (60d)")
-        elif position_increase_pct >= 20.0 and float(row['est_value']) >= 50000:
+        elif position_increase_pct >= 20.0 and est_val >= 50000:
             flags.append("🚀 >20% Skin-in-the-Game")
         else:
             flags.append("Standard Purchase")
@@ -99,7 +102,7 @@ try:
         df = apply_high_conviction_flags(df)
 
         perf = [
-            calculate_trade_performance(row['ticker'], row['transaction_date'], row['shares_bought'], float(row['est_value']))
+            calculate_trade_performance(row['ticker'], row['transaction_date'], row['shares_bought'], float(row['est_value'] or 0))
             for _, row in df.iterrows()
         ]
         df['Unrealized Profit ($)'] = [p[0] for p in perf]
@@ -107,8 +110,8 @@ try:
 
         df['Unrealized Gain'] = df['Unrealized Profit ($)'].apply(lambda x: f"+${x:,.0f}" if x >= 0 else f"-${abs(x):,.0f}")
         df['Total Return'] = df['Return (%)'].apply(lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%")
-        df['Shares Bought'] = df['shares_bought'].apply(lambda x: f"+{x:,.0f}")
-        df['Est. Value ($)'] = df['est_value'].apply(lambda x: f"${x:,.0f}")
+        df['Shares Bought'] = df['shares_bought'].apply(lambda x: f"+{x:,.0f}" if pd.notnull(x) else "+0")
+        df['Est. Value ($)'] = df['est_value'].apply(lambda x: f"${x:,.0f}" if pd.notnull(x) else "$0")
 
         institutional_sectors = ['Private Credit & Funds', 'Funds & ETFs', 'Mutual Funds', 'Unclassified']
         fund_mask = df['sector'].isin(institutional_sectors)
@@ -122,7 +125,7 @@ try:
         col2.metric("🔥 High Conviction Signals", high_alert_count)
         col3.metric("Unique Tickers", df['ticker'].nunique())
         col4.metric("Unique Insiders", df['insider_name'].nunique())
-        col5.metric("Total Dollar Volume", f"${df['est_value'].sum():,.0f}")
+        col5.metric("Total Dollar Volume", f"${df['est_value'].astype(float).sum():,.0f}")
 
         st.markdown("---")
         
