@@ -4,6 +4,7 @@ import pandas as pd
 from edgar import get_filings, set_identity
 import yfinance as yf
 import psycopg2
+import random
 
 # Set required SEC EDGAR identity
 set_identity("JosephLong1226@gmail.com")
@@ -13,7 +14,6 @@ def get_sector_for_ticker(ticker):
     if not ticker or ticker in ["UNKNOWN", "NONE", "N/A"]:
         return "Unclassified"
     
-    # Clean up common ticker formatting issues (e.g., dots to hyphens for share classes like BRK.B)
     cleaned_ticker = ticker.replace(".", "-")
     
     try:
@@ -26,81 +26,60 @@ def get_sector_for_ticker(ticker):
     except Exception:
         return "Unclassified"
 
-def run_market_wide_etl():
-    print("Fetching recent Form 4 filings market-wide (deep historical scan with sectors)...")
+def generate_engaging_summary(cursor, insider, ticker, shares, est_val):
+    """Generate a dynamic, multi-factor narrative executive takeaway."""
+    # Check historical context for this insider/ticker combo in database
+    cursor.execute("""
+        SELECT COUNT(*), SUM(est_value) 
+        FROM insider_trades 
+        WHERE insider_name = %s AND ticker = %s
+    """, (insider, ticker))
+    res = cursor.fetchone()
+    prior_count = res[0] if res else 0
     
-    # Fetch a larger batch of Form 4 filings from SEC EDGAR feed (1,000 filings)
+    # Classify the scale of the trade
+    if est_val >= 5000000:
+        scale_label = f"a massive, multi-million dollar block worth ${est_val:,.0f}"
+    elif est_val >= 1000000:
+        scale_label = f"a heavy seven-figure commitment totaling ${est_val:,.0f}"
+    elif est_val >= 250000:
+        scale_label = f"a substantial ${est_val:,.0f} open-market stake"
+    else:
+        scale_label = f"an open-market purchase valued at ${est_val:,.0f}"
+
+    # Pool of dynamic variations for repeat buyers
+    repeat_phrases = [
+        f"{insider} deepens their conviction in {ticker}, acquiring another +{int(shares):,} shares ({scale_label}) in their ongoing accumulation phase.",
+        f"Continuing a pattern of insider buying, {insider} steps up for another round in {ticker}, picking up +{int(shares):,} shares ({scale_label}).",
+        f"{insider} adds further weight to their position in {ticker}, securing +{int(shares):,} shares ({scale_label}) in a follow-on transaction."
+    ]
+
+    # Pool of dynamic variations for fresh position initiations
+    fresh_phrases = [
+        f"{insider} steps onto the playing field in {ticker}, establishing a fresh position of +{int(shares):,} shares ({scale_label}).",
+        f"Marking a new stake in {ticker}, {insider} acquires +{int(shares):,} shares via {scale_label}.",
+        f"{insider} initiates coverage from the inside out, buying +{int(shares):,} shares of {ticker} ({scale_label})."
+    ]
+
+    if prior_count > 0:
+        return random.choice(repeat_phrases)
+    else:
+        return random.choice(fresh_phrases)
+
+def run_market_wide_etl():
+    print("Fetching recent Form 4 filings market-wide (deep historical scan with narrative engine)...")
+    
     filings = get_filings(form="4")
     recent_filings = filings.head(1000)
     
     parsed_transactions = []
 
-    for filing in recent_filings:
-        try:
-            # Extract raw XML content directly
-            xml_content = filing.xml()
-            if not xml_content:
-                continue
-
-            root = ET.fromstring(xml_content)
-
-            # Extract Insider & Ticker Metadata
-            issuer_ticker_elem = root.find(".//issuer/issuerTradingSymbol")
-            ticker = issuer_ticker_elem.text.upper() if issuer_ticker_elem is not None and issuer_ticker_elem.text else "UNKNOWN"
-
-            rpt_owner_elem = root.find(".//reportingOwner/reportingOwnerId/rptOwnerName")
-            insider = rpt_owner_elem.text if rpt_owner_elem is not None and rpt_owner_elem.text else "Insider Trader"
-
-            # Parse non-derivative open-market transactions
-            for tx in root.findall(".//nonDerivativeTransaction"):
-                code_elem = tx.find(".//transactionCoding/transactionCode")
-                if code_elem is None or code_elem.text != "P":
-                    continue  # Only keep 'P' (Open Market Purchases)
-
-                shares_elem = tx.find(".//transactionAmounts/transactionShares/value")
-                price_elem = tx.find(".//transactionAmounts/transactionPricePerShare/value")
-                date_elem = tx.find(".//transactionDate/value")
-
-                shares = float(shares_elem.text) if shares_elem is not None and shares_elem.text else 0.0
-                price = float(price_elem.text) if price_elem is not None and price_elem.text else 0.0
-                tx_date = date_elem.text if date_elem is not None and date_elem.text else str(filing.filing_date)
-
-                est_val = shares * price
-
-                # Filter for transactions over $50,000
-                if est_val >= 50000 and shares > 0:
-                    # Dynamically look up sector using yfinance
-                    sector = get_sector_for_ticker(ticker)
-                    
-                    parsed_transactions.append({
-                        "transaction_date": tx_date,
-                        "ticker": ticker,
-                        "sector": sector,
-                        "insider_name": insider,
-                        "shares_bought": int(shares),
-                        "est_value": float(est_val),
-                        "activity_type": "Purchase",
-                        "ai_summary": f"{insider} acquired +{int(shares):,} shares of {ticker} via open-market purchase worth ${est_val:,.0f}."
-                    })
-
-        except Exception:
-            # Skip any malformed single filing without crashing the loop
-            continue
-
-    df_new = pd.DataFrame(parsed_transactions)
-    
-    if df_new.empty:
-        print("No open-market purchases over $50k found in this batch.")
-        return
-
-    print(f"Extracted {len(df_new)} high-conviction trades with sector data. Connecting to Supabase...")
-
-    # Connect to Supabase PostgreSQL and Upsert
+    # Connect to Supabase PostgreSQL early so we can check transaction context during parsing
     conn_url = os.environ.get("SUPABASE_DB_URL")
     conn = psycopg2.connect(conn_url)
     cursor = conn.cursor()
 
-    # Ensure table exists before executing inserts
+    # Ensure table exists
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS insider_trades (
             id SERIAL PRIMARY KEY,
@@ -117,12 +96,75 @@ def run_market_wide_etl():
         );
     """)
 
+    for filing in recent_filings:
+        try:
+            xml_content = filing.xml()
+            if not xml_content:
+                continue
+
+            root = ET.fromstring(xml_content)
+
+            issuer_ticker_elem = root.find(".//issuer/issuerTradingSymbol")
+            ticker = issuer_ticker_elem.text.upper() if issuer_ticker_elem is not None and issuer_ticker_elem.text else "UNKNOWN"
+
+            rpt_owner_elem = root.find(".//reportingOwner/reportingOwnerId/rptOwnerName")
+            insider = rpt_owner_elem.text if rpt_owner_elem is not None and rpt_owner_elem.text else "Insider Trader"
+
+            for tx in root.findall(".//nonDerivativeTransaction"):
+                code_elem = tx.find(".//transactionCoding/transactionCode")
+                if code_elem is None or code_elem.text != "P":
+                    continue 
+
+                shares_elem = tx.find(".//transactionAmounts/transactionShares/value")
+                price_elem = tx.find(".//transactionAmounts/transactionPricePerShare/value")
+                date_elem = tx.find(".//transactionDate/value")
+
+                shares = float(shares_elem.text) if shares_elem is not None and shares_elem.text else 0.0
+                price = float(price_elem.text) if price_elem is not None and price_elem.text else 0.0
+                tx_date = date_elem.text if date_elem is not None and date_elem.text else str(filing.filing_date)
+
+                est_val = shares * price
+
+                if est_val >= 50000 and shares > 0:
+                    sector = get_sector_for_ticker(ticker)
+                    
+                    # Generate dynamic narrative takeaway
+                    ai_summary = generate_engaging_summary(cursor, insider, ticker, shares, est_val)
+
+                    parsed_transactions.append({
+                        "transaction_date": tx_date,
+                        "ticker": ticker,
+                        "sector": sector,
+                        "insider_name": insider,
+                        "shares_bought": int(shares),
+                        "est_value": float(est_val),
+                        "activity_type": "Purchase",
+                        "ai_summary": ai_summary
+                    })
+
+        except Exception:
+            continue
+
+    df_new = pd.DataFrame(parsed_transactions)
+    
+    if df_new.empty:
+        print("No open-market purchases over $50k found in this batch.")
+        cursor.close()
+        conn.close()
+        return
+
+    print(f"Extracted {len(df_new)} high-conviction trades with narrative summaries. Upserting into Supabase...")
+
     for _, row in df_new.iterrows():
         cursor.execute("""
             INSERT INTO insider_trades (transaction_date, ticker, sector, insider_name, shares_bought, est_value, activity_type, ai_summary)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (transaction_date, ticker, insider_name, shares_bought, est_value) 
-            DO UPDATE SET sector = EXCLUDED.sector WHERE insider_trades.sector = 'Unclassified';
+            DO UPDATE SET 
+                sector = EXCLUDED.sector,
+                ai_summary = EXCLUDED.ai_summary
+            WHERE insider_trades.sector = 'Unclassified' 
+               OR insider_trades.ai_summary LIKE '%%acquired%%via open-market purchase%%';
         """, (
             row["transaction_date"],
             row["ticker"],
@@ -137,7 +179,7 @@ def run_market_wide_etl():
     conn.commit()
     cursor.close()
     conn.close()
-    print("ETL sector-enrichment sync completed successfully!")
+    print("ETL sync with narrative enhancements completed successfully!")
 
 if __name__ == "__main__":
     run_market_wide_etl()
