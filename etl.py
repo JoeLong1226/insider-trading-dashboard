@@ -1,4 +1,4 @@
-import os
+import osimport os
 import re
 import datetime
 import xml.etree.ElementTree as ET
@@ -32,7 +32,7 @@ FUND_CIK_MAP = {
 }
 
 def resolve_ticker(raw_ticker, issuer_name, issuer_cik=""):
-    """Resolve standard exchange tickers or map known CIK/fund entities."""
+    """Resolve standard exchange tickers or map known CIK/fund entities while filtering junk strings."""
     clean_cik = str(issuer_cik).strip().lstrip("0")
     
     # 1. Primary Check: Direct CIK match
@@ -54,7 +54,8 @@ def resolve_ticker(raw_ticker, issuer_name, issuer_cik=""):
 
     clean = raw_ticker.strip().upper().replace("[", "").replace("]", "")
 
-    if clean in ["NONE", "NULL", "N/A", "UNKNOWN", "UNKNO", "BLACK", "VISTA"]:
+    # Drop generic uninformative filler strings and unmapped entity noise
+    if clean in ["NONE", "NULL", "N/A", "UNKNOWN", "UNKNO", "BLACK", "BLACKS", "VISTA", "5C"]:
         return None
 
     if bool(re.match(r"^[A-Z0-9.\-]+$", clean)) and len(clean) <= 6:
