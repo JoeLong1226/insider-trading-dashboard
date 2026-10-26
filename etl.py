@@ -26,7 +26,7 @@ def is_valid_ticker(raw_ticker, issuer_name):
     if clean in ["NONE", "NULL", "N/A", "UNKNOWN", "UNKNO", "[NONE]", "BLACK", "VISTA"]:
         return None
         
-    if bool(re.match(r"^[A-Z0-9.\-]+\$", clean)) and len(clean) <= 6:
+    if bool(re.match(r"^[A-Z0-9.\-]+$", clean)) and len(clean) <= 6:
         return clean
         
     return None
@@ -65,13 +65,13 @@ def generate_engaging_summary(cursor, insider, ticker, shares, est_val, tx_date)
     prior_count = res[0] if res else 0
     
     if est_val >= 5000000:
-        scale_label = f"a massive, multi-million dollar block worth \${est_val:,.0f}"
+        scale_label = f"a massive, multi-million dollar block worth ${est_val:,.0f}"
     elif est_val >= 1000000:
-        scale_label = f"a heavy seven-figure commitment totaling \${est_val:,.0f}"
+        scale_label = f"a heavy seven-figure commitment totaling ${est_val:,.0f}"
     elif est_val >= 250000:
-        scale_label = f"a substantial \${est_val:,.0f} open-market stake"
+        scale_label = f"a substantial ${est_val:,.0f} open-market stake"
     else:
-        scale_label = f"an open-market purchase valued at \${est_val:,.0f}"
+        scale_label = f"an open-market purchase valued at ${est_val:,.0f}"
 
     repeat_phrases = [
         f"{insider} deepens their conviction in {ticker}, acquiring another +{int(shares):,} shares ({scale_label}) in an ongoing accumulation phase.",
@@ -178,7 +178,7 @@ def run_market_wide_etl():
     df_new = pd.DataFrame(parsed_transactions)
     
     if df_new.empty:
-        print("No valid open-market purchases over \$50k found in this batch.")
+        print("No valid open-market purchases over $50k found in this batch.")
         cursor.close()
         conn.close()
         return
@@ -203,3 +203,13 @@ def run_market_wide_etl():
             row["shares_bought"],
             row["est_value"],
             row["activity_type"],
+            row["ai_summary"]
+        ))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+    print("ETL sync completed successfully with optimized window!")
+
+if __name__ == "__main__":
+    run_market_wide_etl()
