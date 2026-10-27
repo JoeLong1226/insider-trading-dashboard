@@ -14,15 +14,25 @@ def get_db_connection():
 @st.cache_data(ttl=3600)
 def calculate_trade_performance(ticker, tx_date_str, shares, est_value):
     if not ticker or ticker.upper() in ["UNKNOWN", "NONE", "NULL", "N/A"] or shares <= 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     cleaned_ticker = ticker.replace(".", "-")
     try:
         stock = yf.Ticker(cleaned_ticker)
         tx_date = pd.to_datetime(tx_date_str).tz_localize(None)
         current_price = stock.fast_info.get('lastPrice') or stock.info.get('currentPrice')
         hist = stock.history(start=tx_date_str)
-        if hist.empty: return 0.0, 0.0
+        if hist.empty: return 0.0, 0.0, 0.0
         if not current_price: current_price = hist['Close'].iloc[-1]
+
+        # Calculate 30-day price trend prior to trade date for Bullish Divergence
+        start_30d = tx_date - pd.Timedelta(days=30)
+        hist_30d = stock.history(start=start_30d.strftime('%Y-%m-%d'), end=tx_date_str)
+        price_30d_change_pct = 0.0
+        if not hist_30d.empty and len(hist_30d) >= 2:
+            old_p = hist_30d['Close'].iloc[0]
+            new_p = hist_30d['Close'].iloc[-1]
+            if old_p > 0:
+                price_30d_change_pct = ((new_p - old_p) / old_p) * 100.0
 
         current_equity_val = shares * current_price
         capital_gain = current_equity_val - est_value
@@ -34,33 +44,38 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value):
         
         total_dollar_return = capital_gain + (shares * total_div_per_share)
         percent_return = (total_dollar_return / est_value) * 100 if est_value > 0 else 0.0
-        return total_dollar_return, percent_return
+        return total_dollar_return, percent_return, price_30d_change_pct
     except Exception:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
-def apply_high_conviction_flags(df):
-    """Evaluates multi-insider clusters, C-suite accumulation, and verified skin-in-the-game."""
+def process_advanced_conviction_metrics(df):
+    """Calculates Conviction Score and combines multiple icon signals per trade."""
     df['parsed_date'] = pd.to_datetime(df['transaction_date'])
+    
+    sector_volumes = df.groupby('sector')['est_value'].transform('sum')
+    avg_sector_vol = df['est_value'].sum() / max(df['sector'].nunique(), 1)
+
     flags = []
+    scores = []
 
     for idx, row in df.iterrows():
         current_date = row['parsed_date']
         ticker = row['ticker']
         insider = row['insider_name']
+        sector = row['sector']
         title = str(row['insider_title'] or "").upper()
         
         shares_bought = float(row['shares_bought']) if pd.notnull(row['shares_bought']) else 0.0
         shares_following = float(row['shares_owned_following']) if pd.notnull(row['shares_owned_following']) else 0.0
         est_val = float(row['est_value']) if pd.notnull(row['est_value']) else 0.0
+        price_30d_change = row.get('price_30d_change_pct', 0.0)
 
-        # Calculate position percentage increase strictly when prior shares are known and > 0
         prior_shares = shares_following - shares_bought
         if prior_shares > 0 and shares_bought > 0:
             position_increase_pct = (shares_bought / prior_shares) * 100.0
         else:
             position_increase_pct = 0.0
 
-        # Expanded Lookback Window for Clusters
         window_df = df[
             (df['ticker'] == ticker) & 
             (df['parsed_date'] >= current_date - pd.Timedelta(days=60)) & 
@@ -69,19 +84,34 @@ def apply_high_conviction_flags(df):
         
         unique_insiders = window_df['insider_name'].nunique()
         repeat_buys_by_insider = len(window_df[window_df['insider_name'] == insider])
-
         is_csuite = any(t in title for t in ["CEO", "CHIEF EXECUTIVE", "CFO", "CHAIRMAN", "PRESIDENT"])
 
-        # Strict Prioritization Rules (Default to Standard Purchase)
-        if unique_insiders >= 2:
-            flags.append("🔥 Multi-Insider Cluster (60d)")
-        elif is_csuite and repeat_buys_by_insider >= 2:
-            flags.append("⚡ C-Suite Accumulation (60d)")
-        elif position_increase_pct >= 20.0 and est_val >= 50000:
-            flags.append("🚀 >20% Skin-in-the-Game")
-        else:
-            flags.append("Standard Purchase")
+        # Score calculation
+        score = 0
+        score += min(int((est_val / 500000) * 30), 30)
+        if is_csuite: score += 25
+        if unique_insiders >= 2: score += 25
+        elif repeat_buys_by_insider >= 2: score += 15
+        score += min(int((position_increase_pct / 50) * 20), 20)
+        score = min(max(score, 10), 100)
+        scores.append(score)
 
+        # Multi-Icon Accumulation (e.g., 🎯 + 🌐)
+        trade_emojis = []
+        if price_30d_change <= -10.0 and is_csuite and est_val >= 50000:
+            trade_emojis.append("🎯")
+        if unique_insiders >= 2:
+            trade_emojis.append("🔥")
+        if is_csuite and repeat_buys_by_insider >= 2:
+            trade_emojis.append("⚡")
+        if position_increase_pct >= 10.0 and est_val >= 50000:
+            trade_emojis.append("🚀")
+        if sector_volumes.loc[idx] > (avg_sector_vol * 1.5) and sector not in ['Unclassified', 'Private Credit & Funds']:
+            trade_emojis.append("🌐")
+
+        flags.append(" ".join(trade_emojis) if trade_emojis else "—")
+
+    df['Conviction Score'] = scores
     df['High Conviction Flag'] = flags
     return df
 
@@ -98,14 +128,15 @@ try:
     df = pd.read_sql(query, conn)
 
     if not df.empty:
-        df = apply_high_conviction_flags(df)
-
         perf = [
             calculate_trade_performance(row['ticker'], row['transaction_date'], row['shares_bought'], float(row['est_value'] or 0))
             for _, row in df.iterrows()
         ]
         df['Unrealized Profit ($)'] = [p[0] for p in perf]
         df['Return (%)'] = [p[1] for p in perf]
+        df['price_30d_change_pct'] = [p[2] for p in perf]
+
+        df = process_advanced_conviction_metrics(df)
 
         df['Unrealized Gain'] = df['Unrealized Profit ($)'].apply(lambda x: f"+${x:,.0f}" if x >= 0 else f"-${abs(x):,.0f}")
         df['Total Return'] = df['Return (%)'].apply(lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%")
@@ -117,12 +148,12 @@ try:
         df.loc[fund_mask, 'Unrealized Gain'] = "Institutional Allocation"
         df.loc[fund_mask, 'Total Return'] = "N/A"
 
-        high_alert_count = len(df[df['High Conviction Flag'] != "Standard Purchase"])
+        high_alert_count = len(df[df['High Conviction Flag'] != "—"])
 
         col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("Total Trades Tracked", len(df))
         col2.metric("🔥 High Conviction Signals", high_alert_count)
-        col3.metric("Unique Tickers", df['ticker'].nunique())
+        col3.metric("Avg Conviction Score", f"{int(df['Conviction Score'].mean())}/100")
         col4.metric("Unique Insiders", df['insider_name'].nunique())
         col5.metric("Total Dollar Volume", f"${df['est_value'].astype(float).sum():,.0f}")
 
@@ -130,21 +161,32 @@ try:
         
         st.sidebar.header("Filter Dashboard")
         show_flags_only = st.sidebar.checkbox("Show High Conviction Signals Only", value=False)
+        min_score = st.sidebar.slider("Minimum Conviction Score", min_value=10, max_value=90, value=10, step=5)
 
+        # Sidebar Legend
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("### 📖 Signal Legend")
+        st.sidebar.markdown("""
+        * **🎯** **Bullish Divergence** (10%+ stock dip with C-suite buying)
+        * **🔥** **Cluster** (2+ insiders in 60d)
+        * **⚡** **C-Suite Accumulation** (Repeat buying by execs)
+        * **🚀** **Skin-in-the-Game** (10%+ position increase, $50k+)
+        * **🌐** **Sector Rotation** (High volume burst in sector)
+        """)
+
+        display_source = df[df['Conviction Score'] >= min_score]
         if show_flags_only:
-            display_source = df[df['High Conviction Flag'] != "Standard Purchase"]
-        else:
-            display_source = df
+            display_source = display_source[display_source['High Conviction Flag'] != "—"]
 
         st.subheader("📋 Insider Transactions Database")
 
         display_df = display_source[[
-            "transaction_date", "High Conviction Flag", "ticker", "sector", "insider_name", "insider_title",
+            "transaction_date", "Conviction Score", "High Conviction Flag", "ticker", "sector", "insider_name", "insider_title",
             "Shares Bought", "Est. Value ($)", "Unrealized Gain", "Total Return"
         ]]
 
         display_df.columns = [
-            "Transaction Date", "High Conviction Flag", "Ticker", "Sector", "Insider Name", "Title",
+            "Transaction Date", "Score", "Signals", "Ticker", "Sector", "Insider Name", "Title",
             "Shares Bought", "Est. Value ($)", "Unrealized Gain (Inc. Divs)", "Total Return"
         ]
 
