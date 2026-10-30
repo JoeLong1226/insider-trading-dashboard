@@ -1,0 +1,27 @@
+name: Run SEC Historical Backfill
+
+on:
+  workflow_dispatch:
+  # Allows you to click a button on GitHub to run it anytime
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas psycopg2-binary requests
+
+      - name: Run Backfill Script
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          python backfill_sec_history.py
