@@ -14,13 +14,13 @@ def get_db_connection():
 
 
 @st.cache_data(ttl=3600)
-def calculate_trade_performance(ticker, tx_date_str, shares, est_value):
+def calculate_trade_performance(ticker, tx_date_str, shares, est_value_db):
     if (
         not ticker
         or ticker.upper() in ["UNKNOWN", "NONE", "NULL", "N/A"]
-        or est_value <= 0
+        or shares <= 0
     ):
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, est_value_db
     cleaned_ticker = ticker.replace(".", "-")
     try:
         stock = yf.Ticker(cleaned_ticker)
@@ -30,16 +30,19 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value):
         ) or stock.info.get("currentPrice")
         hist = stock.history(start=tx_date_str)
         if hist.empty:
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, est_value_db
         if not current_price:
             current_price = hist["Close"].iloc[-1]
 
         # Split-adjusted purchase price on the transaction date
         tx_price_adj = hist["Close"].iloc[0]
         if tx_price_adj <= 0:
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, est_value_db
 
-        # Stock's actual percentage return (both prices are split-adjusted)
+        # Ground-truth calculation for true invested value (bypasses parser corruptions)
+        true_est_value = shares * tx_price_adj
+
+        # Stock's actual percentage return (both prices split-adjusted)
         stock_pct_return = (current_price - tx_price_adj) / tx_price_adj
 
         # Calculate 30-day price trend prior to trade date for Bullish Divergence
@@ -54,24 +57,30 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value):
             if old_p > 0:
                 price_30d_change_pct = ((new_p - old_p) / old_p) * 100.0
 
-        # Dollar gain = Capital invested * stock's return percentage
-        capital_gain = est_value * stock_pct_return
+        # Dollar gain = True Capital Invested * stock's return percentage
+        capital_gain = true_est_value * stock_pct_return
 
         dividends = stock.dividends
         total_div_dollar = 0.0
         if not dividends.empty:
             dividends.index = dividends.index.tz_localize(None)
             total_div_per_share = dividends[dividends.index >= tx_date].sum()
-            approx_shares = est_value / tx_price_adj
-            total_div_dollar = approx_shares * total_div_per_share
+            total_div_dollar = shares * total_div_per_share
 
         total_dollar_return = capital_gain + total_div_dollar
         percent_return = (
-            (total_dollar_return / est_value) * 100 if est_value > 0 else 0.0
+            (total_dollar_return / true_est_value) * 100
+            if true_est_value > 0
+            else 0.0
         )
-        return total_dollar_return, percent_return, price_30d_change_pct
+        return (
+            total_dollar_return,
+            percent_return,
+            price_30d_change_pct,
+            true_est_value,
+        )
     except Exception:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, est_value_db
 
 
 def process_advanced_conviction_metrics(df):
@@ -181,7 +190,7 @@ try:
             calculate_trade_performance(
                 row["ticker"],
                 row["transaction_date"],
-                row["shares_bought"],
+                float(row["shares_bought"] or 0),
                 float(row["est_value"] or 0),
             )
             for _, row in df.iterrows()
@@ -189,6 +198,7 @@ try:
         df["Unrealized Profit ($)"] = [p[0] for p in perf]
         df["Return (%)"] = [p[1] for p in perf]
         df["price_30d_change_pct"] = [p[2] for p in perf]
+        df["est_value"] = [p[3] for p in perf]  # Apply ground-truth override
 
         df = process_advanced_conviction_metrics(df)
 
