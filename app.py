@@ -84,8 +84,11 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value_db):
 
 
 def process_advanced_conviction_metrics(df):
-    """Calculates Conviction Score and combines multiple icon signals per trade."""
+    """Calculates Point-in-Time Conviction Score (strictly looking backward from trade date)."""
     df["parsed_date"] = pd.to_datetime(df["transaction_date"])
+
+    # Sort chronologically to process sliding point-in-time windows accurately
+    df = df.sort_values(by="parsed_date", ascending=True).reset_index(drop=True)
 
     sector_volumes = df.groupby("sector")["est_value"].transform("sum")
     avg_sector_vol = df["est_value"].sum() / max(df["sector"].nunique(), 1)
@@ -121,10 +124,11 @@ def process_advanced_conviction_metrics(df):
         else:
             position_increase_pct = 0.0
 
+        # POINT-IN-TIME WINDOW: Look STRICTLY backward (Current Date - 60 Days to Current Date)
         window_df = df[
             (df["ticker"] == ticker)
             & (df["parsed_date"] >= current_date - pd.Timedelta(days=60))
-            & (df["parsed_date"] <= current_date + pd.Timedelta(days=60))
+            & (df["parsed_date"] <= current_date)
         ]
 
         unique_insiders = window_df["insider_name"].nunique()
@@ -142,9 +146,9 @@ def process_advanced_conviction_metrics(df):
         if is_csuite:
             score += 25
         if unique_insiders >= 2:
-            score += 25
+            score += 25  # True Cluster at time of filing
         elif repeat_buys_by_insider >= 2:
-            score += 15
+            score += 15  # C-Suite Repeat Buy
         score += min(int((position_increase_pct / 50) * 20), 20)
         score = min(max(score, 10), 100)
         scores.append(score)
@@ -168,7 +172,11 @@ def process_advanced_conviction_metrics(df):
 
     df["Conviction Score"] = scores
     df["High Conviction Flag"] = flags
-    return df
+
+    # Return dataset sorted newest-first for dashboard display
+    return df.sort_values(by="parsed_date", ascending=False).reset_index(
+        drop=True
+    )
 
 
 st.title("📊 Insider Transactions Dashboard")
@@ -198,7 +206,7 @@ try:
         df["Unrealized Profit ($)"] = [p[0] for p in perf]
         df["Return (%)"] = [p[1] for p in perf]
         df["price_30d_change_pct"] = [p[2] for p in perf]
-        df["est_value"] = [p[3] for p in perf]  # Apply ground-truth override
+        df["est_value"] = [p[3] for p in perf]  # Dynamic ground-truth override
 
         df = process_advanced_conviction_metrics(df)
 
@@ -243,7 +251,7 @@ try:
         st.sidebar.markdown("### 📖 Signal Legend")
         st.sidebar.markdown("""
         * **🎯** **Bullish Divergence** (10%+ stock dip with C-suite buying)
-        * **🔥** **Cluster** (2+ insiders in 60d)
+        * **🔥** **Cluster** (2+ insiders in prior 60d)
         * **⚡** **C-Suite Accumulation** (Repeat buying by execs)
         * **🚀** **Skin-in-the-Game** (10%+ position increase, $50k+)
         * **🌐** **Sector Rotation** (High volume burst in sector)
