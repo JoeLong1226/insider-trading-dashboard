@@ -26,7 +26,6 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value_db):
     ):
         return 0.0, 0.0, 0.0, est_value_db
     
-    # Safely truncate date string to 'YYYY-MM-DD' to drop any trailing timezone offsets
     clean_date_str = str(tx_date_str)[:10]
     cleaned_ticker = ticker.replace(".", "-")
     
@@ -87,7 +86,6 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value_db):
 
 def process_advanced_conviction_metrics(df):
     """Calculates Point-in-Time Conviction Score strictly looking backward."""
-    # Strip timezone offsets before converting to datetime
     df["parsed_date"] = pd.to_datetime(df["transaction_date"].astype(str).str[:10])
     df = df.sort_values(by="parsed_date", ascending=True).reset_index(drop=True)
 
@@ -192,7 +190,12 @@ try:
         "Max Rows to Load & Analyze", 50, 1000, 200, step=50
     )
 
-    # Dynamic SQL query based on year selection (Timezone-safe string matching)
+    # Toggle to hide/show institutional blockholders & unclassified funds
+    hide_institutions = st.sidebar.checkbox(
+        "Hide Institutional / Unclassified Blocks", value=True
+    )
+
+    # Dynamic SQL query based on year selection
     if selected_year == "All Years":
         query = f"""
             SELECT transaction_date, ticker, sector, insider_name, insider_title, shares_bought, shares_owned_following, est_value, activity_type 
@@ -218,6 +221,17 @@ try:
         """
 
     df = pd.read_sql(query, conn)
+
+    if not df.empty:
+        # Apply institutional filter if checked
+        institutional_sectors = [
+            "Private Credit & Funds",
+            "Funds & ETFs",
+            "Mutual Funds",
+            "Unclassified",
+        ]
+        if hide_institutions:
+            df = df[~df["sector"].isin(institutional_sectors)].reset_index(drop=True)
 
     if not df.empty:
         perf = [
@@ -248,16 +262,6 @@ try:
         df["Est. Value ($)"] = df["est_value"].apply(
             lambda x: f"${x:,.0f}" if pd.notnull(x) else "$0"
         )
-
-        institutional_sectors = [
-            "Private Credit & Funds",
-            "Funds & ETFs",
-            "Mutual Funds",
-            "Unclassified",
-        ]
-        fund_mask = df["sector"].isin(institutional_sectors)
-        df.loc[fund_mask, "Unrealized Gain"] = "Institutional Allocation"
-        df.loc[fund_mask, "Total Return"] = "N/A"
 
         show_flags_only = st.sidebar.checkbox(
             "Show High Conviction Signals Only", value=False
@@ -343,9 +347,7 @@ try:
 
         with tab2:
             st.subheader("🏆 Aggregate Insider Performance Leaderboard")
-            leaderboard_source = df[
-                ~df["sector"].isin(institutional_sectors)
-            ].copy()
+            leaderboard_source = df.copy()
 
             if not leaderboard_source.empty:
                 leaderboard = (
