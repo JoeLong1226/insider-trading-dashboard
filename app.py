@@ -4,7 +4,11 @@ import psycopg2
 import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title="Insider Trading Dashboard", layout="wide")
+st.set_page_config(
+    page_title="Insider Trading Dashboard",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 
 @st.cache_resource
@@ -13,7 +17,7 @@ def get_db_connection():
     return psycopg2.connect(conn_url)
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=86400)  # Cache stock performance for 24 hours to prevent lag
 def calculate_trade_performance(ticker, tx_date_str, shares, est_value_db):
     if (
         not ticker
@@ -34,18 +38,13 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value_db):
         if not current_price:
             current_price = hist["Close"].iloc[-1]
 
-        # Split-adjusted purchase price on the transaction date
         tx_price_adj = hist["Close"].iloc[0]
         if tx_price_adj <= 0:
             return 0.0, 0.0, 0.0, est_value_db
 
-        # Ground-truth calculation for true invested value (bypasses parser corruptions)
         true_est_value = shares * tx_price_adj
-
-        # Stock's actual percentage return (both prices split-adjusted)
         stock_pct_return = (current_price - tx_price_adj) / tx_price_adj
 
-        # Calculate 30-day price trend prior to trade date for Bullish Divergence
         start_30d = tx_date - pd.Timedelta(days=30)
         hist_30d = stock.history(
             start=start_30d.strftime("%Y-%m-%d"), end=tx_date_str
@@ -57,9 +56,7 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value_db):
             if old_p > 0:
                 price_30d_change_pct = ((new_p - old_p) / old_p) * 100.0
 
-        # Dollar gain = True Capital Invested * stock's return percentage
         capital_gain = true_est_value * stock_pct_return
-
         dividends = stock.dividends
         total_div_dollar = 0.0
         if not dividends.empty:
@@ -84,10 +81,8 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value_db):
 
 
 def process_advanced_conviction_metrics(df):
-    """Calculates Point-in-Time Conviction Score (strictly looking backward from trade date)."""
+    """Calculates Point-in-Time Conviction Score strictly looking backward."""
     df["parsed_date"] = pd.to_datetime(df["transaction_date"])
-
-    # Sort chronologically to process sliding point-in-time windows accurately
     df = df.sort_values(by="parsed_date", ascending=True).reset_index(drop=True)
 
     sector_volumes = df.groupby("sector")["est_value"].transform("sum")
@@ -124,7 +119,6 @@ def process_advanced_conviction_metrics(df):
         else:
             position_increase_pct = 0.0
 
-        # POINT-IN-TIME WINDOW: Look STRICTLY backward (Current Date - 60 Days to Current Date)
         window_df = df[
             (df["ticker"] == ticker)
             & (df["parsed_date"] >= current_date - pd.Timedelta(days=60))
@@ -140,20 +134,18 @@ def process_advanced_conviction_metrics(df):
             for t in ["CEO", "CHIEF EXECUTIVE", "CFO", "CHAIRMAN", "PRESIDENT"]
         )
 
-        # Score calculation
         score = 0
         score += min(int((est_val / 500000) * 30), 30)
         if is_csuite:
             score += 25
         if unique_insiders >= 2:
-            score += 25  # True Cluster at time of filing
+            score += 25
         elif repeat_buys_by_insider >= 2:
-            score += 15  # C-Suite Repeat Buy
+            score += 15
         score += min(int((position_increase_pct / 50) * 20), 20)
         score = min(max(score, 10), 100)
         scores.append(score)
 
-        # Multi-Icon Accumulation
         trade_emojis = []
         if price_30d_change <= -10.0 and is_csuite and est_val >= 50000:
             trade_emojis.append("🎯")
@@ -172,8 +164,6 @@ def process_advanced_conviction_metrics(df):
 
     df["Conviction Score"] = scores
     df["High Conviction Flag"] = flags
-
-    # Return dataset sorted newest-first for dashboard display
     return df.sort_values(by="parsed_date", ascending=False).reset_index(
         drop=True
     )
@@ -186,235 +176,265 @@ st.write(
 
 try:
     conn = get_db_connection()
-    query = """
+
+    # Sidebar Controls FIRST so we can limit SQL load if needed
+    st.sidebar.header("Filter Dashboard")
+    selected_year = st.sidebar.selectbox(
+        "Filter by Year", ["All Years", "2026", "2025", "2024", "2023", "Older"]
+    )
+    max_rows = st.sidebar.slider(
+        "Max Rows to Load & Analyze", 50, 1000, 200, step50
+    )
+
+    # Construct efficient query with limit
+    query = f"""
         SELECT transaction_date, ticker, sector, insider_name, insider_title, shares_bought, shares_owned_following, est_value, activity_type 
         FROM insider_trades 
-        ORDER BY transaction_date DESC;
+        ORDER BY transaction_date DESC
+        LIMIT {max_rows};
     """
     df = pd.read_sql(query, conn)
 
     if not df.empty:
-        perf = [
-            calculate_trade_performance(
-                row["ticker"],
-                row["transaction_date"],
-                float(row["shares_bought"] or 0),
-                float(row["est_value"] or 0),
+        df["parsed_year"] = pd.to_datetime(df["transaction_date"]).dt.year.astype(
+            str
+        )
+        if selected_year != "All Years":
+            if selected_year == "Older":
+                df = df[df["parsed_year"].astype(int) < 2024]
+            else:
+                df = df[df["parsed_year"] == selected_year]
+
+        if df.empty:
+            st.warning(
+                f"No transactions found for the selected filter ({selected_year})."
             )
-            for _, row in df.iterrows()
-        ]
-        df["Unrealized Profit ($)"] = [p[0] for p in perf]
-        df["Return (%)"] = [p[1] for p in perf]
-        df["price_30d_change_pct"] = [p[2] for p in perf]
-        df["est_value"] = [p[3] for p in perf]  # Dynamic ground-truth override
+        else:
+            perf = [
+                calculate_trade_performance(
+                    row["ticker"],
+                    row["transaction_date"],
+                    float(row["shares_bought"] or 0),
+                    float(row["est_value"] or 0),
+                )
+                for _, row in df.iterrows()
+            ]
+            df["Unrealized Profit ($)"] = [p[0] for p in perf]
+            df["Return (%)"] = [p[1] for p in perf]
+            df["price_30d_change_pct"] = [p[2] for p in perf]
+            df["est_value"] = [p[3] for p in perf]
 
-        df = process_advanced_conviction_metrics(df)
+            df = process_advanced_conviction_metrics(df)
 
-        df["Unrealized Gain"] = df["Unrealized Profit ($)"].apply(
-            lambda x: f"+${x:,.0f}" if x >= 0 else f"-${abs(x):,.0f}"
-        )
-        df["Total Return"] = df["Return (%)"].apply(
-            lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
-        )
-        df["Shares Bought"] = df["shares_bought"].apply(
-            lambda x: f"+{x:,.0f}" if pd.notnull(x) else "+0"
-        )
-        df["Est. Value ($)"] = df["est_value"].apply(
-            lambda x: f"${x:,.0f}" if pd.notnull(x) else "$0"
-        )
-
-        institutional_sectors = [
-            "Private Credit & Funds",
-            "Funds & ETFs",
-            "Mutual Funds",
-            "Unclassified",
-        ]
-        fund_mask = df["sector"].isin(institutional_sectors)
-        df.loc[fund_mask, "Unrealized Gain"] = "Institutional Allocation"
-        df.loc[fund_mask, "Total Return"] = "N/A"
-
-        # Sidebar Filter Controls
-        st.sidebar.header("Filter Dashboard")
-        show_flags_only = st.sidebar.checkbox(
-            "Show High Conviction Signals Only", value=False
-        )
-        min_score = st.sidebar.slider(
-            "Minimum Conviction Score",
-            min_value=10,
-            max_value=90,
-            value=10,
-            step=5,
-        )
-
-        # Sidebar Signal Legend
-        st.sidebar.markdown("---")
-        st.sidebar.markdown("### 📖 Signal Legend")
-        st.sidebar.markdown("""
-        * **🎯** **Bullish Divergence** (10%+ stock dip with C-suite buying)
-        * **🔥** **Cluster** (2+ insiders in prior 60d)
-        * **⚡** **C-Suite Accumulation** (Repeat buying by execs)
-        * **🚀** **Skin-in-the-Game** (10%+ position increase, $50k+)
-        * **🌐** **Sector Rotation** (High volume burst in sector)
-        """)
-
-        # Main Navigation Tabs
-        tab1, tab2 = st.tabs(["📊 Live Transactions Feed", "🏆 Insider Leaderboard"])
-
-        with tab1:
-            high_alert_count = len(df[df["High Conviction Flag"] != "—"])
-
-            col1, col2, col3, col4, col5 = st.columns(5)
-            col1.metric("Total Trades Tracked", len(df))
-            col2.metric("🔥 High Conviction Signals", high_alert_count)
-            col3.metric(
-                "Avg Conviction Score", f"{int(df['Conviction Score'].mean())}/100"
+            df["Unrealized Gain"] = df["Unrealized Profit ($)"].apply(
+                lambda x: f"+${x:,.0f}" if x >= 0 else f"-${abs(x):,.0f}"
             )
-            col4.metric("Unique Insiders", df["insider_name"].nunique())
-            col5.metric(
-                "Total Dollar Volume",
-                f"${df['est_value'].astype(float).sum():,.0f}",
+            df["Total Return"] = df["Return (%)"].apply(
+                lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
+            )
+            df["Shares Bought"] = df["shares_bought"].apply(
+                lambda x: f"+{x:,.0f}" if pd.notnull(x) else "+0"
+            )
+            df["Est. Value ($)"] = df["est_value"].apply(
+                lambda x: f"${x:,.0f}" if pd.notnull(x) else "$0"
             )
 
-            st.markdown("---")
+            institutional_sectors = [
+                "Private Credit & Funds",
+                "Funds & ETFs",
+                "Mutual Funds",
+                "Unclassified",
+            ]
+            fund_mask = df["sector"].isin(institutional_sectors)
+            df.loc[fund_mask, "Unrealized Gain"] = "Institutional Allocation"
+            df.loc[fund_mask, "Total Return"] = "N/A"
 
-            display_source = df[df["Conviction Score"] >= min_score]
-            if show_flags_only:
-                display_source = display_source[
-                    display_source["High Conviction Flag"] != "—"
+            show_flags_only = st.sidebar.checkbox(
+                "Show High Conviction Signals Only", value=False
+            )
+            min_score = st.sidebar.slider(
+                "Minimum Conviction Score",
+                min_value=10,
+                max_value=90,
+                value=10,
+                step=5,
+            )
+
+            st.sidebar.markdown("---")
+            st.sidebar.markdown("### 📖 Signal Legend")
+            st.sidebar.markdown("""
+            * **🎯** **Bullish Divergence** (10%+ stock dip with C-suite buying)
+            * **🔥** **Cluster** (2+ insiders in prior 60d)
+            * **⚡** **C-Suite Accumulation** (Repeat buying by execs)
+            * **🚀** **Skin-in-the-Game** (10%+ position increase, $50k+)
+            * **🌐** **Sector Rotation** (High volume burst in sector)
+            """)
+
+            tab1, tab2 = st.tabs([
+                "📊 Live Transactions Feed",
+                "🏆 Insider Leaderboard",
+            ])
+
+            with tab1:
+                high_alert_count = len(df[df["High Conviction Flag"] != "—"])
+
+                col1, col2, col3, col4, col5 = st.columns(5)
+                col1.metric("Total Trades Tracked", len(df))
+                col2.metric("🔥 High Conviction Signals", high_alert_count)
+                col3.metric(
+                    "Avg Conviction Score",
+                    f"{int(df['Conviction Score'].mean())}/100",
+                )
+                col4.metric("Unique Insiders", df["insider_name"].nunique())
+                col5.metric(
+                    "Total Dollar Volume",
+                    f"${df['est_value'].astype(float).sum():,.0f}",
+                )
+
+                st.markdown("---")
+
+                display_source = df[df["Conviction Score"] >= min_score]
+                if show_flags_only:
+                    display_source = display_source[
+                        display_source["High Conviction Flag"] != "—"
+                    ]
+
+                st.subheader("📋 Insider Transactions Database")
+
+                display_df = display_source[[
+                    "transaction_date",
+                    "Conviction Score",
+                    "High Conviction Flag",
+                    "ticker",
+                    "sector",
+                    "insider_name",
+                    "insider_title",
+                    "Shares Bought",
+                    "Est. Value ($)",
+                    "Unrealized Gain",
+                    "Total Return",
+                ]]
+
+                display_df.columns = [
+                    "Transaction Date",
+                    "Score",
+                    "Signals",
+                    "Ticker",
+                    "Sector",
+                    "Insider Name",
+                    "Title",
+                    "Shares Bought",
+                    "Est. Value ($)",
+                    "Unrealized Gain (Inc. Divs)",
+                    "Total Return",
                 ]
 
-            st.subheader("📋 Insider Transactions Database")
+                st.dataframe(display_df, use_container_width=True)
 
-            display_df = display_source[[
-                "transaction_date",
-                "Conviction Score",
-                "High Conviction Flag",
-                "ticker",
-                "sector",
-                "insider_name",
-                "insider_title",
-                "Shares Bought",
-                "Est. Value ($)",
-                "Unrealized Gain",
-                "Total Return",
-            ]]
+            with tab2:
+                st.subheader("🏆 Aggregate Insider Performance Leaderboard")
+                leaderboard_source = df[
+                    ~df["sector"].isin(institutional_sectors)
+                ].copy()
 
-            display_df.columns = [
-                "Transaction Date",
-                "Score",
-                "Signals",
-                "Ticker",
-                "Sector",
-                "Insider Name",
-                "Title",
-                "Shares Bought",
-                "Est. Value ($)",
-                "Unrealized Gain (Inc. Divs)",
-                "Total Return",
-            ]
-
-            st.dataframe(display_df, use_container_width=True)
-
-        with tab2:
-            st.subheader("🏆 Aggregate Insider Performance Leaderboard")
-            st.write(
-                "Insiders aggregated across all their tracked open-market purchases and current market holdings."
-            )
-
-            leaderboard_source = df[~df["sector"].isin(institutional_sectors)].copy()
-
-            if not leaderboard_source.empty:
-                leaderboard = (
-                    leaderboard_source.groupby(["insider_name", "ticker"])
-                    .agg({
-                        "shares_bought": "sum",
-                        "est_value": "sum",
-                        "Unrealized Profit ($)": "sum",
-                    })
-                    .reset_index()
-                )
-
-                leaderboard["roi_pct"] = (
-                    leaderboard["Unrealized Profit ($)"]
-                    / leaderboard["est_value"]
-                ) * 100.0
-
-                leaderboard["Total Invested"] = leaderboard["est_value"].apply(
-                    lambda x: f"${x:,.0f}"
-                )
-                leaderboard["Net Profit/Loss ($)"] = leaderboard[
-                    "Unrealized Profit ($)"
-                ].apply(lambda x: f"+${x:,.0f}" if x >= 0 else f"-${abs(x):,.0f}")
-                leaderboard["Cumulative ROI (%)"] = leaderboard["roi_pct"].apply(
-                    lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
-                )
-
-                col_left, col_right = st.columns(2)
-
-                with col_left:
-                    st.markdown("### 🟢 Top 10 Dollar Winners ($)")
-                    top_dollar_winners = leaderboard.sort_values(
-                        by="Unrealized Profit ($)", ascending=False
-                    ).head(10)
-                    st.dataframe(
-                        top_dollar_winners[[
-                            "insider_name",
-                            "ticker",
-                            "Total Invested",
-                            "Net Profit/Loss ($)",
-                            "Cumulative ROI (%)",
-                        ]],
-                        use_container_width=True,
+                if not leaderboard_source.empty:
+                    leaderboard = (
+                        leaderboard_source.groupby(["insider_name", "ticker"])
+                        .agg({
+                            "shares_bought": "sum",
+                            "est_value": "sum",
+                            "Unrealized Profit ($)": "sum",
+                        })
+                        .reset_index()
                     )
 
-                    st.markdown("### 🔴 Top 10 Dollar Losers ($)")
-                    top_dollar_losers = leaderboard.sort_values(
-                        by="Unrealized Profit ($)", ascending=True
-                    ).head(10)
-                    st.dataframe(
-                        top_dollar_losers[[
-                            "insider_name",
-                            "ticker",
-                            "Total Invested",
-                            "Net Profit/Loss ($)",
-                            "Cumulative ROI (%)",
-                        ]],
-                        use_container_width=True,
-                    )
+                    leaderboard["roi_pct"] = (
+                        leaderboard["Unrealized Profit ($)"]
+                        / leaderboard["est_value"]
+                    ) * 100.0
 
-                with col_right:
-                    st.markdown("### 🚀 Top 10 ROI Winners (%)")
-                    top_pct_winners = leaderboard.sort_values(
-                        by="roi_pct", ascending=False
-                    ).head(10)
-                    st.dataframe(
-                        top_pct_winners[[
-                            "insider_name",
-                            "ticker",
-                            "Total Invested",
-                            "Net Profit/Loss ($)",
-                            "Cumulative ROI (%)",
-                        ]],
-                        use_container_width=True,
+                    leaderboard["Total Invested"] = leaderboard[
+                        "est_value"
+                    ].apply(lambda x: f"${x:,.0f}")
+                    leaderboard["Net Profit/Loss ($)"] = leaderboard[
+                        "Unrealized Profit ($)"
+                    ].apply(
+                        lambda x: f"+${x:,.0f}"
+                        if x >= 0
+                        else f"-${abs(x):,.0f}"
                     )
+                    leaderboard["Cumulative ROI (%)"] = leaderboard[
+                        "roi_pct"
+                    ].apply(lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%")
 
-                    st.markdown("### 📉 Top 10 ROI Losers (%)")
-                    top_pct_losers = leaderboard.sort_values(
-                        by="roi_pct", ascending=True
-                    ).head(10)
-                    st.dataframe(
-                        top_pct_losers[[
-                            "insider_name",
-                            "ticker",
-                            "Total Invested",
-                            "Net Profit/Loss ($)",
-                            "Cumulative ROI (%)",
-                        ]],
-                        use_container_width=True,
+                    col_left, col_right = st.columns(2)
+
+                    with col_left:
+                        st.markdown("### 🟢 Top Dollar Winners ($)")
+                        top_dollar_winners = leaderboard.sort_values(
+                            by="Unrealized Profit ($)", ascending=False
+                        ).head(10)
+                        st.dataframe(
+                            top_dollar_winners[[
+                                "insider_name",
+                                "ticker",
+                                "Total Invested",
+                                "Net Profit/Loss ($)",
+                                "Cumulative ROI (%)",
+                            ]],
+                            use_container_width=True,
+                        )
+
+                        st.markdown("### 🔴 Top Dollar Losers ($)")
+                        top_dollar_losers = leaderboard.sort_values(
+                            by="Unrealized Profit ($)", ascending=True
+                        ).head(10)
+                        st.dataframe(
+                            top_dollar_losers[[
+                                "insider_name",
+                                "ticker",
+                                "Total Invested",
+                                "Net Profit/Loss ($)",
+                                "Cumulative ROI (%)",
+                            ]],
+                            use_container_width=True,
+                        )
+
+                    with col_right:
+                        st.markdown("### 🚀 Top ROI Winners (%)")
+                        top_pct_winners = leaderboard.sort_values(
+                            by="roi_pct", ascending=False
+                        ).head(10)
+                        st.dataframe(
+                            top_pct_winners[[
+                                "insider_name",
+                                "ticker",
+                                "Total Invested",
+                                "Net Profit/Loss ($)",
+                                "Cumulative ROI (%)",
+                            ]],
+                            use_container_width=True,
+                        )
+
+                        st.markdown("### 📉 Top ROI Losers (%)")
+                        top_pct_losers = leaderboard.sort_values(
+                            by="roi_pct", ascending=True
+                        ).head(10)
+                        st.dataframe(
+                            top_pct_losers[[
+                                "insider_name",
+                                "ticker",
+                                "Total Invested",
+                                "Net Profit/Loss ($)",
+                                "Cumulative ROI (%)",
+                            ]],
+                            use_container_width=True,
+                        )
+                else:
+                    st.info(
+                        "No equity insider trades available for leaderboard"
+                        " calculation."
                     )
-            else:
-                st.info("No equity insider trades available for leaderboard calculation.")
-
     else:
         st.info("No insider transactions found in database.")
 
