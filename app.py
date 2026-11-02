@@ -25,14 +25,18 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value_db):
         or shares <= 0
     ):
         return 0.0, 0.0, 0.0, est_value_db
+    
+    # Safely truncate date string to 'YYYY-MM-DD' to drop any trailing timezone offsets
+    clean_date_str = str(tx_date_str)[:10]
     cleaned_ticker = ticker.replace(".", "-")
+    
     try:
         stock = yf.Ticker(cleaned_ticker)
-        tx_date = pd.to_datetime(tx_date_str).tz_localize(None)
+        tx_date = pd.to_datetime(clean_date_str)
         current_price = stock.fast_info.get(
             "lastPrice"
         ) or stock.info.get("currentPrice")
-        hist = stock.history(start=tx_date_str)
+        hist = stock.history(start=clean_date_str)
         if hist.empty:
             return 0.0, 0.0, 0.0, est_value_db
         if not current_price:
@@ -47,7 +51,7 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value_db):
 
         start_30d = tx_date - pd.Timedelta(days=30)
         hist_30d = stock.history(
-            start=start_30d.strftime("%Y-%m-%d"), end=tx_date_str
+            start=start_30d.strftime("%Y-%m-%d"), end=clean_date_str
         )
         price_30d_change_pct = 0.0
         if not hist_30d.empty and len(hist_30d) >= 2:
@@ -60,7 +64,8 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value_db):
         dividends = stock.dividends
         total_div_dollar = 0.0
         if not dividends.empty:
-            dividends.index = dividends.index.tz_localize(None)
+            if dividends.index.tz is not None:
+                dividends.index = dividends.index.tz_localize(None)
             total_div_per_share = dividends[dividends.index >= tx_date].sum()
             total_div_dollar = shares * total_div_per_share
 
@@ -82,7 +87,8 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value_db):
 
 def process_advanced_conviction_metrics(df):
     """Calculates Point-in-Time Conviction Score strictly looking backward."""
-    df["parsed_date"] = pd.to_datetime(df["transaction_date"])
+    # Strip timezone offsets before converting to datetime
+    df["parsed_date"] = pd.to_datetime(df["transaction_date"].astype(str).str[:10])
     df = df.sort_values(by="parsed_date", ascending=True).reset_index(drop=True)
 
     sector_volumes = df.groupby("sector")["est_value"].transform("sum")
