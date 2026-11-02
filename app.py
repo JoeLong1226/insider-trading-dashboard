@@ -186,7 +186,7 @@ try:
         "Max Rows to Load & Analyze", 50, 1000, 200, step=50
     )
 
-    # Dynamic SQL query based on year selection
+    # Dynamic SQL query based on year selection (Timezone-safe string matching)
     if selected_year == "All Years":
         query = f"""
             SELECT transaction_date, ticker, sector, insider_name, insider_title, shares_bought, shares_owned_following, est_value, activity_type 
@@ -198,7 +198,7 @@ try:
         query = f"""
             SELECT transaction_date, ticker, sector, insider_name, insider_title, shares_bought, shares_owned_following, est_value, activity_type 
             FROM insider_trades 
-            WHERE EXTRACT(YEAR FROM transaction_date::date) < 2024
+            WHERE LEFT(transaction_date, 4) < '2024'
             ORDER BY transaction_date DESC
             LIMIT {max_rows};
         """
@@ -206,7 +206,7 @@ try:
         query = f"""
             SELECT transaction_date, ticker, sector, insider_name, insider_title, shares_bought, shares_owned_following, est_value, activity_type 
             FROM insider_trades 
-            WHERE EXTRACT(YEAR FROM transaction_date::date) = {selected_year}
+            WHERE LEFT(transaction_date, 4) = '{selected_year}'
             ORDER BY transaction_date DESC
             LIMIT {max_rows};
         """
