@@ -102,7 +102,7 @@ def parse_and_insert_form4(entries, min_value=50000):
 
 
 if __name__ == "__main__":
-    years_to_backfill = [2024, 2025, 2026]
+    years_to_backfill = [2025]
     
     for year in years_to_backfill:
         for qtr in range(1, 5):
