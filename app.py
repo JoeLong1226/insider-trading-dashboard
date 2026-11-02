@@ -190,9 +190,9 @@ try:
         "Max Rows to Load & Analyze", 50, 1000, 200, step=50
     )
 
-    # Toggle to hide/show institutional blockholders & unclassified funds
+    # Toggle to filter out institutional/fund entity names cleanly
     hide_institutions = st.sidebar.checkbox(
-        "Hide Institutional / Unclassified Blocks", value=True
+        "Hide Institutional / Fund Entities", value=False
     )
 
     # Dynamic SQL query based on year selection
@@ -223,15 +223,11 @@ try:
     df = pd.read_sql(query, conn)
 
     if not df.empty:
-        # Apply institutional filter if checked
-        institutional_sectors = [
-            "Private Credit & Funds",
-            "Funds & ETFs",
-            "Mutual Funds",
-            "Unclassified",
-        ]
+        # Filter out funds/partnerships by name patterns if checked, preserving unclassified corporate executives
         if hide_institutions:
-            df = df[~df["sector"].isin(institutional_sectors)].reset_index(drop=True)
+            fund_keywords = ["LLC", "L.P.", "PARTNERS", "FUNDS", "CAPITAL", "INVESTMENT", "MANAGEMENT"]
+            pattern = '|'.join(fund_keywords)
+            df = df[~df['insider_name'].str.upper().str.contains(pattern, na=False)].reset_index(drop=True)
 
     if not df.empty:
         perf = [
