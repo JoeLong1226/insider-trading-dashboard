@@ -183,7 +183,7 @@ try:
         "Filter by Year", ["All Years", "2026", "2025", "2024", "2023", "Older"]
     )
     max_rows = st.sidebar.slider(
-        "Max Rows to Load & Analyze", 50, 1000, 200, step50
+        "Max Rows to Load & Analyze", 50, 1000, 200, step=50
     )
 
     # Construct efficient query with limit
