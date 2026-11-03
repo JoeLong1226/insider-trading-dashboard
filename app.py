@@ -17,6 +17,22 @@ def get_db_connection():
     return psycopg2.connect(conn_url)
 
 
+@st.cache_data(ttl=86400)  # Cache sector lookups for 24 hours
+def get_stock_sector(ticker):
+    if not ticker or ticker.upper() in ["UNKNOWN", "NONE", "NULL", "N/A"]:
+        return "Unclassified"
+    try:
+        cleaned_ticker = ticker.replace(".", "-")
+        stock = yf.Ticker(cleaned_ticker)
+        # Try to pull sector from fast_info or info dictionary
+        sector = stock.info.get("sector")
+        if sector:
+            return sector
+    except Exception:
+        pass
+    return "Unclassified"
+
+
 @st.cache_data(ttl=86400)  # Cache stock performance for 24 hours to prevent lag
 def calculate_trade_performance(ticker, tx_date_str, shares, est_value_db):
     if (
@@ -223,6 +239,12 @@ try:
     df = pd.read_sql(query, conn)
 
     if not df.empty:
+        # Dynamically resolve 'Unclassified' sectors on the fly using yfinance
+        df["sector"] = df.apply(
+            lambda row: get_stock_sector(row["ticker"]) if row["sector"] in ["Unclassified", None, ""] else row["sector"],
+            axis=1
+        )
+
         # Filter out funds/partnerships by name patterns if checked, preserving unclassified corporate executives
         if hide_institutions:
             fund_keywords = ["LLC", "L.P.", "PARTNERS", "FUNDS", "CAPITAL", "INVESTMENT", "MANAGEMENT"]
