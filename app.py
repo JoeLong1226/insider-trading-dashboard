@@ -1,4 +1,4 @@
-import os
+import osimport os
 import pandas as pd
 import psycopg2
 import streamlit as st
@@ -21,10 +21,19 @@ def get_db_connection():
 def get_stock_sector(ticker):
     if not ticker or ticker.upper() in ["UNKNOWN", "NONE", "NULL", "N/A"]:
         return "Unclassified"
+    
+    # Manual fallback overrides for any tickers Yahoo Finance misses
+    sector_fallbacks = {
+        "PBPB": "Consumer Cyclical",
+        "TTSH": "Healthcare",
+    }
+    cleaned_upper = ticker.upper().strip()
+    if cleaned_upper in sector_fallbacks:
+        return sector_fallbacks[cleaned_upper]
+
     try:
         cleaned_ticker = ticker.replace(".", "-")
         stock = yf.Ticker(cleaned_ticker)
-        # Try to pull sector from fast_info or info dictionary
         sector = stock.info.get("sector")
         if sector:
             return sector
@@ -239,7 +248,7 @@ try:
     df = pd.read_sql(query, conn)
 
     if not df.empty:
-        # Dynamically resolve 'Unclassified' sectors on the fly using yfinance
+        # Dynamically resolve 'Unclassified' sectors on the fly using yfinance & manual overrides
         df["sector"] = df.apply(
             lambda row: get_stock_sector(row["ticker"]) if row["sector"] in ["Unclassified", None, ""] else row["sector"],
             axis=1
