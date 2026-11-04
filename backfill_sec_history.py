@@ -42,6 +42,19 @@ def fetch_quarterly_index(year, quarter):
     return form4_entries
 
 
+def fetch_monthly_entries(year, month):
+    """Fetches the quarterly index and filters for a specific month (e.g., '2026-09')."""
+    qtr = (month - 1) // 3 + 1
+    print(f"--- Fetching QTR {qtr} index for {year} (Targeting month: {year}-{month:02d}) ---")
+    all_entries = fetch_quarterly_index(year, qtr)
+    
+    target_prefix = f"{year}-{month:02d}"
+    filtered_entries = [e for e in all_entries if e['date_filed'].startswith(target_prefix)]
+    
+    print(f"Found {len(filtered_entries)} filings for {target_prefix}.")
+    return filtered_entries
+
+
 def parse_and_insert_form4(entries, min_value=50000):
     """Loops through Form 4 entries, parses open-market buys, and inserts into Supabase."""
     conn = get_db_connection()
@@ -102,12 +115,16 @@ def parse_and_insert_form4(entries, min_value=50000):
 
 
 if __name__ == "__main__":
-    years_to_backfill = [2025]
+    # Define months to backfill in reverse chronological order
+    months_to_backfill = [
+        (2026, 9),  # September 2026
+        (2026, 8),  # August 2026
+        (2026, 7),  # July 2026
+    ]
     
-    for year in years_to_backfill:
-        for qtr in range(1, 5):
-            print(f"--- Processing {year} Quarter {qtr} ---")
-            entries = fetch_quarterly_index(year, qtr)
-            if entries:
-                print(f"Found {len(entries)} Form 4 filings. Parsing open-market buys...")
-                parse_and_insert_form4(entries)
+    for year, month in months_to_backfill:
+        print(f"\n================ Processing {year}-{month:02d} ================")
+        entries = fetch_monthly_entries(year, month)
+        if entries:
+            print(f"Parsing open-market buys...")
+            parse_and_insert_form4(entries)
