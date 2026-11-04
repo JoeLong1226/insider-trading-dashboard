@@ -32,17 +32,26 @@ def resolve_ticker(raw_ticker, issuer_name, issuer_cik=""):
     return None
 
 def get_sector_for_ticker(ticker):
-    if ticker in ["BREC", "BPRE", "BCRED", "BMACX", "MXF"]: return "Private Credit & Funds"
+    if ticker in ["BREC", "BPRE", "BCRED", "BMACX", "MXF"]: 
+        return "Private Credit & Funds"
+    
     cleaned_ticker = ticker.replace(".", "-")
     try:
         stock = yf.Ticker(cleaned_ticker)
         info = stock.info
         sector = info.get("sector")
-        if sector: return sector
-        if info.get("quoteType", "").upper() in ["ETF", "MUTUALFUND"]: return "Funds & ETFs"
-        return "Unclassified"
+        if sector: 
+            return sector
+        
+        quote_type = info.get("quoteType", "").upper()
+        if quote_type in ["ETF", "MUTUALFUND"]: 
+            return "Funds & ETFs"
+        elif quote_type == "EQUITY":
+            return "General Equity"
+        
+        return "General Equity"
     except Exception:
-        return "Funds & ETFs"
+        return "General Equity"
 
 def run_market_wide_etl():
     start_date = (datetime.date.today() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')
