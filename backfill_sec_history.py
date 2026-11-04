@@ -17,7 +17,7 @@ def get_db_connection():
 def fetch_quarterly_index(year, quarter):
     """Downloads SEC master index file for a given year & quarter."""
     url = f"https://www.sec.gov/Archives/edgar/full-index/{year}/QTR{quarter}/master.idx"
-    response = requests.get(url, headers=HEADERS)
+    response = requests.get(url, headers=HEADERS, timeout=15)
     if response.status_code != 200:
         print(f"Failed to fetch index for {year} Q{quarter}: Status {response.status_code}")
         return []
@@ -42,21 +42,18 @@ def fetch_quarterly_index(year, quarter):
     return form4_entries
 
 
-def fetch_monthly_entries(year, month):
-    """Fetches the quarterly index and filters for a specific month (e.g., '2026-09')."""
+def parse_and_insert_month(year, month, min_value=50000):
+    """Fetches the quarter index, filters strictly for the target month, and parses XMLs."""
     qtr = (month - 1) // 3 + 1
-    print(f"--- Fetching QTR {qtr} index for {year} (Targeting month: {year}-{month:02d}) ---")
+    target_prefix = f"{year}-{month:02d}"
+    print(f"--- Fetching QTR {qtr} index for {year} (Targeting: {target_prefix}) ---")
+    
     all_entries = fetch_quarterly_index(year, qtr)
     
-    target_prefix = f"{year}-{month:02d}"
+    # Pre-filter the list BEFORE looping so we ignore everything else entirely
     filtered_entries = [e for e in all_entries if e['date_filed'].startswith(target_prefix)]
-    
-    print(f"Found {len(filtered_entries)} filings for {target_prefix}.")
-    return filtered_entries
+    print(f"Found {len(filtered_entries)} Form 4 filings for {target_prefix}. Starting ingestion...")
 
-
-def parse_and_insert_form4(entries, min_value=50000):
-    """Loops through Form 4 entries, parses open-market buys, and inserts into Supabase."""
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -67,12 +64,12 @@ def parse_and_insert_form4(entries, min_value=50000):
     """
     
     inserted_count = 0
-    for entry in entries:
+    for i, entry in enumerate(filtered_entries):
         txt_url = f"https://www.sec.gov/Archives/{entry['filename']}"
         time.sleep(0.12)  # Respect SEC rate limits
         
         try:
-            res = requests.get(txt_url, headers=HEADERS)
+            res = requests.get(txt_url, headers=HEADERS, timeout=10)
             if res.status_code != 200 or "<xml>" not in res.text.lower():
                 continue
                 
@@ -107,24 +104,17 @@ def parse_and_insert_form4(entries, min_value=50000):
                         inserted_count += 1
             conn.commit()
         except Exception:
+            # Skip any bad formatting or connection drops gracefully
             continue
             
-    print(f"  -> Successfully inserted {inserted_count} transactions.")
+        if (i + 1) % 500 == 0:
+            print(f"Processed {i + 1}/{len(filtered_entries)} filings... Inserted {inserted_count} so far.")
+
+    print(f"-> Completed {target_prefix}! Successfully inserted {inserted_count} transactions.")
     cursor.close()
     conn.close()
 
 
 if __name__ == "__main__":
-    # Define months to backfill in reverse chronological order
-    months_to_backfill = [
-        (2026, 9),  # September 2026
-        (2026, 8),  # August 2026
-        (2026, 7),  # July 2026
-    ]
-    
-    for year, month in months_to_backfill:
-        print(f"\n================ Processing {year}-{month:02d} ================")
-        entries = fetch_monthly_entries(year, month)
-        if entries:
-            print(f"Parsing open-market buys...")
-            parse_and_insert_form4(entries)
+    # Test with just ONE single month first (September 2026)
+    parse_and_insert_month(2026, 9)
