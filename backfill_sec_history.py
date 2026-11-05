@@ -1,7 +1,7 @@
 import os
 import time
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 import psycopg2
 import requests
 import xml.etree.ElementTree as ET
@@ -35,7 +35,7 @@ def get_sector_for_ticker(ticker):
     if ":" in clean_ticker:
         clean_ticker = clean_ticker.split(":")[-1].strip()
         
-    # Strip brackets or unwanted spaces
+    # Strip brackets, unwanted spaces, or weird formatting
     clean_ticker = re.sub(r'[\[\]\s]', '', clean_ticker)
     
     # Handle dual-class / multi-ticker formatting like "HEI, HEI.A" -> "HEI"
@@ -150,6 +150,7 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
                 if code == 'P' and acquired == 'A':
                     tx_date = tx.findtext(".//transactionDate/value") or entry['date_filed']
                     
+                    # STRICT DATE BOUNDS FILTER
                     if not (start_date_str <= tx_date <= end_date_str):
                         continue
                         
