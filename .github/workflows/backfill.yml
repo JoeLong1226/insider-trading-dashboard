@@ -34,4 +34,4 @@ jobs:
           START_DATE: ${{ github.event.inputs.start_date }}
           END_DATE: ${{ github.event.inputs.end_date }}
         run: |
-          python backfill_sec_history.py
+          python backfill_sec_history.py "$START_DATE" "$END_DATE"
