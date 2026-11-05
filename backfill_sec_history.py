@@ -25,9 +25,23 @@ sector_cache = {
     "GOOGL": "Communication Services"
 }
 
-def get_sector_for_ticker(ticker):
+def infer_sector_from_name(company_name):
+    name = company_name.upper()
+    if any(k in name for k in ["TOURISM", "ENTERTAINMENT", "HOTEL", "RESORT", "RESTAURANT", "TRAVEL"]):
+        return "Consumer Cyclical"
+    if any(k in name for k in ["ENERGY", "OIL", "GAS", "POWER", "ELECTRIC"]):
+        return "Utilities"
+    if any(k in name for k in ["PHARMA", "HEALTH", "BIOTECH", "MEDICAL"]):
+        return "Healthcare"
+    if any(k in name for k in ["BANK", "FINANCIAL", "CAPITAL", "INVESTMENT", "FUND"]):
+        return "Financial Services"
+    if any(k in name for k in ["TECH", "SOFTWARE", "SYSTEMS", "SOLUTIONS"]):
+        return "Technology"
+    return "General Equity"
+
+def get_sector_for_ticker(ticker, company_name=""):
     if not ticker or ticker in ("NONE", "UNKNOWN", "N/A", "NULL"):
-        return "General Equity"
+        return infer_sector_from_name(company_name)
     
     clean_ticker = ticker.strip().upper()
     
@@ -44,17 +58,18 @@ def get_sector_for_ticker(ticker):
     elif "/" in clean_ticker:
         clean_ticker = clean_ticker.split("/")[0].strip()
 
-    # If the ticker ended up as an exchange name or empty, short-circuit immediately
     if clean_ticker in ("NYSE", "NASDAQ", "AMEX", "ARCX", "OTC", ""):
-        return "General Equity"
+        return infer_sector_from_name(company_name)
 
     if clean_ticker in sector_cache:
         return sector_cache[clean_ticker]
     
-    # Build candidate lookup list (supports international tickers like Brazilian B3 symbols ending in digits)
+    # Build candidate lookup list (supports Brazilian B3 .SA and OTC Pink Sheets .PK)
     candidates = [clean_ticker]
-    if re.search(r'\d+$', clean_ticker):
+    if re.search(r'\d+\$', clean_ticker):
         candidates.append(f"{clean_ticker}.SA")
+    else:
+        candidates.append(f"{clean_ticker}.PK")
         
     for sym in candidates:
         try:
@@ -67,8 +82,10 @@ def get_sector_for_ticker(ticker):
         except Exception:
             continue
         
-    sector_cache[clean_ticker] = "General Equity"
-    return "General Equity"
+    # Fallback: intelligently infer from company name instead of generic default
+    fallback_sector = infer_sector_from_name(company_name)
+    sector_cache[clean_ticker] = fallback_sector
+    return fallback_sector
 
 
 def fetch_quarterly_index(year, quarter):
@@ -147,52 +164,14 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
                     ticker = found.strip().upper()
                     break
             
-            if ticker == "NONE":
-                continue
-
+            company_name = entry.get('company', '')
             insider = root.findtext(".//rptOwnerName") or "UNKNOWN"
             title = root.findtext(".//officerTitle") or "Director/Other"
-            sector = get_sector_for_ticker(ticker)
+            sector = get_sector_for_ticker(ticker, company_name)
             
             for tx in root.findall(".//nonDerivativeTransaction"):
                 code = tx.findtext(".//transactionCoding/transactionCode")
                 acquired = tx.findtext(".//transactionAmounts/transactionAcquiredDisposedCode/value")
                 
                 if code == 'P' and acquired == 'A':
-                    tx_date = tx.findtext(".//transactionDate/value") or entry['date_filed']
-                    
-                    # STRICT DATE BOUNDS FILTER
-                    if not (start_date_str <= tx_date <= end_date_str):
-                        continue
-                        
-                    shares = float(tx.findtext(".//transactionShares/value") or 0)
-                    price = float(tx.findtext(".//transactionPricePerShare/value") or 0)
-                    following = float(tx.findtext(".//sharesOwnedFollowingTransaction/value") or 0)
-                    
-                    est_val = shares * price
-                    if est_val >= min_value:
-                        cursor.execute(insert_query, (
-                            tx_date, ticker, sector, insider, title,
-                            shares, following, est_val, "Open Market Purchase"
-                        ))
-                        inserted_count += 1
-            conn.commit()
-        except Exception:
-            continue
-            
-        if (i + 1) % 200 == 0:
-            print(f"Processed {i + 1}/{len(filtered_entries)} filings... Inserted {inserted_count} so far.")
-
-    print(f"-> Completed period {start_date_str} to {end_date_str}! Successfully inserted {inserted_count} transactions.")
-    cursor.close()
-    conn.close()
-
-
-if __name__ == "__main__":
-    start_date_str = os.environ.get("START_DATE", "2026-10-01")
-    end_date_str = os.environ.get("END_DATE", "2026-10-07")
-    
-    print(f"=== Starting SEC Master Index Ingestion Pipeline ===")
-    print(f"Target Range: {start_date_str} to {end_date_str}")
-
-    parse_and_insert_range(start_date_str, end_date_str)
+                    tx_date = tx.findtext(".//transaction
