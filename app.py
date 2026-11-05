@@ -155,9 +155,11 @@ def process_advanced_conviction_metrics(df):
         ]
 
         unique_insiders = window_df["insider_name"].nunique()
-        repeat_buys_by_insider = len(
-            window_df[window_df["insider_name"] == insider]
-        )
+        
+        # Count distinct buy dates instead of raw rows to accurately measure true repeat buying
+        insider_window = window_df[window_df["insider_name"] == insider]
+        distinct_buy_days = insider_window["parsed_date"].nunique()
+
         is_csuite = any(
             t in title
             for t in ["CEO", "CHIEF EXECUTIVE", "CFO", "CHAIRMAN", "PRESIDENT"]
@@ -169,7 +171,7 @@ def process_advanced_conviction_metrics(df):
             score += 25
         if unique_insiders >= 2:
             score += 25
-        elif repeat_buys_by_insider >= 2:
+        elif distinct_buy_days >= 2:
             score += 15
         score += min(int((position_increase_pct / 50) * 20), 20)
         score = min(max(score, 10), 100)
@@ -180,7 +182,7 @@ def process_advanced_conviction_metrics(df):
             trade_emojis.append("🎯")
         if unique_insiders >= 2:
             trade_emojis.append("🔥")
-        if is_csuite and repeat_buys_by_insider >= 2:
+        if is_csuite and distinct_buy_days >= 2:
             trade_emojis.append("⚡")
         if position_increase_pct >= 10.0 and est_val >= 50000:
             trade_emojis.append("🚀")
