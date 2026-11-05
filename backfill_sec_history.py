@@ -29,6 +29,13 @@ def get_sector_for_ticker(ticker):
         return "General Equity"
     
     clean_ticker = ticker.strip().upper()
+    
+    # Handle dual-class / multi-ticker formatting like "HEI, HEI.A" -> "HEI"
+    if "," in clean_ticker:
+        clean_ticker = clean_ticker.split(",")[0].strip()
+    elif "/" in clean_ticker:
+        clean_ticker = clean_ticker.split("/")[0].strip()
+
     if clean_ticker in sector_cache:
         return sector_cache[clean_ticker]
     
