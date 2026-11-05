@@ -1,5 +1,6 @@
 import os
 import time
+import re
 from datetime import datetime, timedelta
 import psycopg2
 import requests
@@ -29,6 +30,13 @@ def get_sector_for_ticker(ticker):
         return "General Equity"
     
     clean_ticker = ticker.strip().upper()
+    
+    # Clean up exchange prefixes like "NYSE: VTEX" -> "VTEX"
+    if ":" in clean_ticker:
+        clean_ticker = clean_ticker.split(":")[-1].strip()
+        
+    # Strip brackets or unwanted spaces
+    clean_ticker = re.sub(r'[\[\]\s]', '', clean_ticker)
     
     # Handle dual-class / multi-ticker formatting like "HEI, HEI.A" -> "HEI"
     if "," in clean_ticker:
@@ -142,7 +150,6 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
                 if code == 'P' and acquired == 'A':
                     tx_date = tx.findtext(".//transactionDate/value") or entry['date_filed']
                     
-                    # STRICT FILTER: Discard out-of-bounds historical transactions
                     if not (start_date_str <= tx_date <= end_date_str):
                         continue
                         
@@ -170,8 +177,8 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
 
 
 if __name__ == "__main__":
-    start_date_str = os.environ.get("START_DATE", "2026-10-07")
-    end_date_str = os.environ.get("END_DATE", "2026-10-14")
+    start_date_str = os.environ.get("START_DATE", "2026-10-01")
+    end_date_str = os.environ.get("END_DATE", "2026-10-06")
     
     print(f"=== Starting SEC Master Index Ingestion Pipeline ===")
     print(f"Target Range: {start_date_str} to {end_date_str}")
