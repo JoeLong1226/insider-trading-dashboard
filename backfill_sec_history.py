@@ -25,33 +25,37 @@ sector_cache = {
     "GOOGL": "Communication Services"
 }
 
+
 def infer_sector_from_name(company_name):
     name = company_name.upper()
     if any(k in name for k in ["TOURISM", "ENTERTAINMENT", "HOTEL", "RESORT", "RESTAURANT", "TRAVEL"]):
         return "Consumer Cyclical"
     if any(k in name for k in ["ENERGY", "OIL", "GAS", "POWER", "ELECTRIC"]):
         return "Utilities"
-    if any(k in name for k in ["PHARMA", "HEALTH", "BIOTECH", "MEDICAL"]):
+    if any(k in name for k in ["PHARMA", "HEALTH", "BIOTECH", "MEDICAL", "THERAPEUTICS"]):
         return "Healthcare"
     if any(k in name for k in ["BANK", "FINANCIAL", "CAPITAL", "INVESTMENT", "FUND"]):
         return "Financial Services"
     if any(k in name for k in ["TECH", "SOFTWARE", "SYSTEMS", "SOLUTIONS"]):
         return "Technology"
+    if any(k in name for k in ["GOLD", "MINING", "RESOURCES", "METALS"]):
+        return "Basic Materials"
     return "General Equity"
+
 
 def get_sector_for_ticker(ticker, company_name=""):
     if not ticker or ticker in ("NONE", "UNKNOWN", "N/A", "NULL"):
         return infer_sector_from_name(company_name)
-    
+     
     clean_ticker = ticker.strip().upper()
-    
+     
     # Clean up exchange prefixes like "NYSE: VTEX" -> "VTEX"
     if ":" in clean_ticker:
         clean_ticker = clean_ticker.split(":")[-1].strip()
-        
+         
     # Strip brackets, unwanted spaces, or weird formatting
     clean_ticker = re.sub(r'[\[\]\s]', '', clean_ticker)
-    
+     
     # Handle dual-class / multi-ticker formatting like "HEI, HEI.A" -> "HEI"
     if "," in clean_ticker:
         clean_ticker = clean_ticker.split(",")[0].strip()
@@ -63,14 +67,13 @@ def get_sector_for_ticker(ticker, company_name=""):
 
     if clean_ticker in sector_cache:
         return sector_cache[clean_ticker]
-    
-    # Build candidate lookup list (supports Brazilian B3 .SA and OTC Pink Sheets .PK)
+     
     candidates = [clean_ticker]
     if re.search(r'\d+\$', clean_ticker):
         candidates.append(f"{clean_ticker}.SA")
     else:
         candidates.append(f"{clean_ticker}.PK")
-        
+         
     for sym in candidates:
         try:
             tk = yf.Ticker(sym)
@@ -81,8 +84,7 @@ def get_sector_for_ticker(ticker, company_name=""):
                 return sector
         except Exception:
             continue
-        
-    # Fallback: intelligently infer from company name instead of generic default
+         
     fallback_sector = infer_sector_from_name(company_name)
     sector_cache[clean_ticker] = fallback_sector
     return fallback_sector
@@ -97,7 +99,7 @@ def fetch_quarterly_index(year, quarter):
 
     lines = response.text.split('\n')
     form4_entries = []
-    
+     
     data_started = False
     for line in lines:
         if "CIK|Company Name|Form Type|Date Filed|Filename" in line:
@@ -118,12 +120,12 @@ def fetch_quarterly_index(year, quarter):
 def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
     start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
-    
+     
     qtr = (start_dt.month - 1) // 3 + 1
     print(f"--- Fetching QTR {qtr} index for {start_dt.year} ({start_date_str} to {end_date_str}) ---")
-    
+     
     all_entries = fetch_quarterly_index(start_dt.year, qtr)
-    
+     
     filtered_entries = [
         e for e in all_entries 
         if start_date_str <= e['date_filed'] <= end_date_str
@@ -132,46 +134,87 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    
+     
     insert_query = """
         INSERT INTO insider_trades (transaction_date, ticker, sector, insider_name, insider_title, shares_bought, shares_owned_following, est_value, activity_type)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING;
     """
-    
+     
     inserted_count = 0
     for i, entry in enumerate(filtered_entries):
         txt_url = f"https://www.sec.gov/Archives/{entry['filename']}"
         time.sleep(0.12)
-        
+         
         try:
             res = requests.get(txt_url, headers=HEADERS, timeout=10)
             if res.status_code != 200 or "<xml>" not in res.text.lower():
                 continue
-                
+                 
             xml_start = res.text.find("<XML>")
             xml_end = res.text.find("</XML>")
             if xml_start == -1 or xml_end == -1:
                 continue
-                
+                 
             xml_content = res.text[xml_start+5:xml_end].strip()
             root = ET.fromstring(xml_content)
-            
+             
             ticker = "NONE"
             for tag in [".//issuerTradingSymbol", ".//tradingSymbol", ".//symbol"]:
                 found = root.findtext(tag)
                 if found and found.strip() and found.strip().upper() not in ["NONE", "N/A", "NULL", ""]:
                     ticker = found.strip().upper()
                     break
-            
+             
             company_name = entry.get('company', '')
             insider = root.findtext(".//rptOwnerName") or "UNKNOWN"
             title = root.findtext(".//officerTitle") or "Director/Other"
             sector = get_sector_for_ticker(ticker, company_name)
-            
+             
             for tx in root.findall(".//nonDerivativeTransaction"):
                 code = tx.findtext(".//transactionCoding/transactionCode")
                 acquired = tx.findtext(".//transactionAmounts/transactionAcquiredDisposedCode/value")
-                
+                 
                 if code == 'P' and acquired == 'A':
-                    tx_date = tx.findtext(".//transaction
+                    tx_date = tx.findtext(".//transactionDate/value")
+                    if not tx_date:
+                        continue
+                         
+                    shares_str = tx.findtext(".//transactionShares/value")
+                    shares = float(shares_str) if shares_str else 0.0
+                    
+                    price_str = tx.findtext(".//transactionPricePerShare/value")
+                    price = float(price_str) if price_str else 0.0
+                    
+                    est_val = shares * price
+                    if est_val < min_value:
+                        continue
+                         
+                    owned_str = tx.findtext(".//sharesOwnedFollowingTransaction/value")
+                    owned = float(owned_str) if owned_str else 0.0
+                    
+                    try:
+                        cursor.execute(insert_query, (
+                            tx_date, ticker, sector, insider, title, shares, owned, est_val, "BUY"
+                        ))
+                        conn.commit()
+                        inserted_count += 1
+                    except Exception as db_err:
+                        conn.rollback()
+                        print(f"DB Insert Error: {db_err}")
+                        
+        except Exception:
+            continue
+
+    cursor.close()
+    conn.close()
+    print(f"--- Finished backfill. Inserted {inserted_count} records. ---")
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) >= 3:
+        parse_and_insert_range(sys.argv[1], sys.argv[2])
+    else:
+        # Default test range
+        parse_and_insert_range("2026-11-01", "2026-11-05")
