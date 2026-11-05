@@ -31,7 +31,25 @@ def resolve_ticker(raw_ticker, issuer_name, issuer_cik=""):
     if bool(re.match(r"^[A-Z0-9.\-]+$", clean)) and len(clean) <= 6: return clean
     return None
 
-def get_sector_for_ticker(ticker):
+def infer_sector_from_name(company_name):
+    if not company_name:
+        return "General Equity"
+    name = company_name.upper()
+    if any(k in name for k in ["TOURISM", "ENTERTAINMENT", "HOTEL", "RESORT", "RESTAURANT", "TRAVEL"]):
+        return "Consumer Cyclical"
+    if any(k in name for k in ["ENERGY", "OIL", "GAS", "POWER", "ELECTRIC"]):
+        return "Utilities"
+    if any(k in name for k in ["PHARMA", "HEALTH", "BIOTECH", "MEDICAL", "THERAPEUTICS"]):
+        return "Healthcare"
+    if any(k in name for k in ["BANK", "FINANCIAL", "CAPITAL", "INVESTMENT", "FUND"]):
+        return "Financial Services"
+    if any(k in name for k in ["TECH", "SOFTWARE", "SYSTEMS", "SOLUTIONS"]):
+        return "Technology"
+    if any(k in name for k in ["GOLD", "MINING", "RESOURCES", "METALS"]):
+        return "Basic Materials"
+    return "General Equity"
+
+def get_sector_for_ticker(ticker, issuer_name=""):
     if ticker in ["BREC", "BPRE", "BCRED", "BMACX", "MXF"]: 
         return "Private Credit & Funds"
     
@@ -39,19 +57,17 @@ def get_sector_for_ticker(ticker):
     try:
         stock = yf.Ticker(cleaned_ticker)
         info = stock.info
-        sector = info.get("sector")
+        sector = info.get("sector") or info.get("industry")
         if sector: 
             return sector
         
         quote_type = info.get("quoteType", "").upper()
         if quote_type in ["ETF", "MUTUALFUND"]: 
             return "Funds & ETFs"
-        elif quote_type == "EQUITY":
-            return "General Equity"
         
-        return "General Equity"
+        return infer_sector_from_name(issuer_name)
     except Exception:
-        return "General Equity"
+        return infer_sector_from_name(issuer_name)
 
 def run_market_wide_etl():
     start_date = (datetime.date.today() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')
@@ -126,7 +142,7 @@ def run_market_wide_etl():
                 est_val = shares * price
 
                 if est_val >= 50000 and shares > 0:
-                    sector = get_sector_for_ticker(ticker)
+                    sector = get_sector_for_ticker(ticker, issuer_name)
                     parsed_transactions.append({
                         "transaction_date": tx_date, "ticker": ticker, "sector": sector,
                         "insider_name": insider, "insider_title": title,
