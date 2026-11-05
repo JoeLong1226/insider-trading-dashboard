@@ -1,9 +1,11 @@
 import os
 import time
-import pandas as pd
+from datetime import datetime, timedelta
+from dateutil.rrule import rrule, MONTHLY
 import psycopg2
 import requests
 import xml.etree.ElementTree as ET
+import yfinance as yf
 
 # SEC policy requires a custom User-Agent declaration
 HEADERS = {'User-Agent': 'InsiderTradingApp admin@example.com'}
@@ -11,7 +13,32 @@ SUPABASE_URL = os.environ.get("SUPABASE_DB_URL")
 
 
 def get_db_connection():
+    if not SUPABASE_URL:
+        raise ValueError("Missing database connection string. Set SUPABASE_DB_URL.")
     return psycopg2.connect(SUPABASE_URL)
+
+
+# Sector cache to prevent redundant yfinance lookups
+sector_cache = {}
+
+def get_sector_for_ticker(ticker):
+    if not ticker or ticker in ("NONE", "N/A", "UNKNOWN", "nan", ""):
+        return "General Equity"
+    
+    clean_ticker = ticker.strip().upper()
+    if clean_ticker in sector_cache:
+        return sector_cache[clean_ticker]
+    
+    try:
+        tk = yf.Ticker(clean_ticker)
+        sector = tk.info.get("sector")
+        if not sector:
+            sector = "General Equity"
+        sector_cache[clean_ticker] = sector
+        return sector
+    except Exception:
+        sector_cache[clean_ticker] = "General Equity"
+        return "General Equity"
 
 
 def fetch_quarterly_index(year, quarter):
@@ -85,6 +112,9 @@ def parse_and_insert_month(year, month, min_value=50000):
             insider = root.findtext(".//rptOwnerName") or "UNKNOWN"
             title = root.findtext(".//officerTitle") or "Director/Other"
             
+            # Use yfinance lookup with General Equity fallback instead of hardcoded Unclassified
+            sector = get_sector_for_ticker(ticker)
+            
             for tx in root.findall(".//nonDerivativeTransaction"):
                 code = tx.findtext(".//transactionCoding/transactionCode")
                 acquired = tx.findtext(".//transactionAmounts/transactionAcquiredDisposedCode/value")
@@ -98,7 +128,7 @@ def parse_and_insert_month(year, month, min_value=50000):
                     est_val = shares * price
                     if est_val >= min_value:
                         cursor.execute(insert_query, (
-                            tx_date, ticker, "Unclassified", insider, title,
+                            tx_date, ticker, sector, insider, title,
                             shares, following, est_val, "Open Market Purchase"
                         ))
                         inserted_count += 1
@@ -116,5 +146,18 @@ def parse_and_insert_month(year, month, min_value=50000):
 
 
 if __name__ == "__main__":
-    # Test with just ONE single month first (September 2026)
-    parse_and_insert_month(2026, 9)
+    # Pull dynamic dates from GitHub Actions environment variables (defaulting to August 2026 if run locally)
+    start_date_str = os.environ.get("START_DATE", "2026-08-01")
+    end_date_str = os.environ.get("END_DATE", "2026-08-31")
+    
+    start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
+
+    print(f"=== Starting Historical SEC Master Index Ingestion Pipeline ===")
+    print(f"Target Range: {start_date_str} to {end_date_str}")
+
+    # Loop month-by-month across the selected window
+    for dt in rrule(MONTHLY, dtstart=start_dt, until=end_dt):
+        parse_and_insert_month(dt.year, dt.month)
+
+    print("\n=== All historical backfill tasks completed successfully! ===")
