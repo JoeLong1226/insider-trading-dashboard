@@ -44,17 +44,28 @@ def get_sector_for_ticker(ticker):
     elif "/" in clean_ticker:
         clean_ticker = clean_ticker.split("/")[0].strip()
 
+    # If the ticker ended up as an exchange name or empty, short-circuit immediately
+    if clean_ticker in ("NYSE", "NASDAQ", "AMEX", "ARCX", "OTC", ""):
+        return "General Equity"
+
     if clean_ticker in sector_cache:
         return sector_cache[clean_ticker]
     
-    try:
-        tk = yf.Ticker(clean_ticker)
-        sector = tk.info.get("sector")
-        if sector:
-            sector_cache[clean_ticker] = sector
-            return sector
-    except Exception:
-        pass
+    # Build candidate lookup list (supports international tickers like Brazilian B3 symbols ending in digits)
+    candidates = [clean_ticker]
+    if re.search(r'\d+$', clean_ticker):
+        candidates.append(f"{clean_ticker}.SA")
+        
+    for sym in candidates:
+        try:
+            tk = yf.Ticker(sym)
+            info = tk.info
+            sector = info.get("sector") or info.get("industry")
+            if sector:
+                sector_cache[clean_ticker] = sector
+                return sector
+        except Exception:
+            continue
         
     sector_cache[clean_ticker] = "General Equity"
     return "General Equity"
@@ -179,7 +190,7 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
 
 if __name__ == "__main__":
     start_date_str = os.environ.get("START_DATE", "2026-10-01")
-    end_date_str = os.environ.get("END_DATE", "2026-10-06")
+    end_date_str = os.environ.get("END_DATE", "2026-10-07")
     
     print(f"=== Starting SEC Master Index Ingestion Pipeline ===")
     print(f"Target Range: {start_date_str} to {end_date_str}")
