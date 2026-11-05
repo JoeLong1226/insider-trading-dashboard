@@ -1,13 +1,11 @@
 import os
 import time
 from datetime import datetime, timedelta
-from dateutil.rrule import rrule, MONTHLY
 import psycopg2
 import requests
 import xml.etree.ElementTree as ET
 import yfinance as yf
 
-# SEC policy requires a custom User-Agent declaration
 HEADERS = {'User-Agent': 'InsiderTradingApp admin@example.com'}
 SUPABASE_URL = os.environ.get("SUPABASE_DB_URL")
 
@@ -18,11 +16,16 @@ def get_db_connection():
     return psycopg2.connect(SUPABASE_URL)
 
 
-# Sector cache to prevent redundant yfinance lookups
-sector_cache = {}
+sector_cache = {
+    "AON": "Financial Services",
+    "AAPL": "Technology",
+    "MSFT": "Technology",
+    "AMZN": "Consumer Cyclical",
+    "GOOGL": "Communication Services"
+}
 
 def get_sector_for_ticker(ticker):
-    if not ticker or ticker in ("NONE", "N/A", "UNKNOWN", "nan", ""):
+    if not ticker or ticker in ("NONE", "UNKNOWN", "N/A", "NULL"):
         return "General Equity"
     
     clean_ticker = ticker.strip().upper()
@@ -32,17 +35,17 @@ def get_sector_for_ticker(ticker):
     try:
         tk = yf.Ticker(clean_ticker)
         sector = tk.info.get("sector")
-        if not sector:
-            sector = "General Equity"
-        sector_cache[clean_ticker] = sector
-        return sector
+        if sector:
+            sector_cache[clean_ticker] = sector
+            return sector
     except Exception:
-        sector_cache[clean_ticker] = "General Equity"
-        return "General Equity"
+        pass
+        
+    sector_cache[clean_ticker] = "General Equity"
+    return "General Equity"
 
 
 def fetch_quarterly_index(year, quarter):
-    """Downloads SEC master index file for a given year & quarter."""
     url = f"https://www.sec.gov/Archives/edgar/full-index/{year}/QTR{quarter}/master.idx"
     response = requests.get(url, headers=HEADERS, timeout=15)
     if response.status_code != 200:
@@ -69,17 +72,20 @@ def fetch_quarterly_index(year, quarter):
     return form4_entries
 
 
-def parse_and_insert_month(year, month, min_value=50000):
-    """Fetches the quarter index, filters strictly for the target month, and parses XMLs."""
-    qtr = (month - 1) // 3 + 1
-    target_prefix = f"{year}-{month:02d}"
-    print(f"--- Fetching QTR {qtr} index for {year} (Targeting: {target_prefix}) ---")
+def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
+    start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
     
-    all_entries = fetch_quarterly_index(year, qtr)
+    qtr = (start_dt.month - 1) // 3 + 1
+    print(f"--- Fetching QTR {qtr} index for {start_dt.year} ({start_date_str} to {end_date_str}) ---")
     
-    # Pre-filter the list BEFORE looping so we ignore everything else entirely
-    filtered_entries = [e for e in all_entries if e['date_filed'].startswith(target_prefix)]
-    print(f"Found {len(filtered_entries)} Form 4 filings for {target_prefix}. Starting ingestion...")
+    all_entries = fetch_quarterly_index(start_dt.year, qtr)
+    
+    filtered_entries = [
+        e for e in all_entries 
+        if start_date_str <= e['date_filed'] <= end_date_str
+    ]
+    print(f"Found {len(filtered_entries)} Form 4 filings for target period. Starting ingestion...")
 
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -93,7 +99,7 @@ def parse_and_insert_month(year, month, min_value=50000):
     inserted_count = 0
     for i, entry in enumerate(filtered_entries):
         txt_url = f"https://www.sec.gov/Archives/{entry['filename']}"
-        time.sleep(0.12)  # Respect SEC rate limits
+        time.sleep(0.12)
         
         try:
             res = requests.get(txt_url, headers=HEADERS, timeout=10)
@@ -108,11 +114,18 @@ def parse_and_insert_month(year, month, min_value=50000):
             xml_content = res.text[xml_start+5:xml_end].strip()
             root = ET.fromstring(xml_content)
             
-            ticker = root.findtext(".//issuerTradingSymbol") or "UNKNOWN"
+            ticker = "NONE"
+            for tag in [".//issuerTradingSymbol", ".//tradingSymbol", ".//symbol"]:
+                found = root.findtext(tag)
+                if found and found.strip() and found.strip().upper() not in ["NONE", "N/A", "NULL", ""]:
+                    ticker = found.strip().upper()
+                    break
+            
+            if ticker == "NONE":
+                continue
+
             insider = root.findtext(".//rptOwnerName") or "UNKNOWN"
             title = root.findtext(".//officerTitle") or "Director/Other"
-            
-            # Use yfinance lookup with General Equity fallback instead of hardcoded Unclassified
             sector = get_sector_for_ticker(ticker)
             
             for tx in root.findall(".//nonDerivativeTransaction"):
@@ -121,6 +134,11 @@ def parse_and_insert_month(year, month, min_value=50000):
                 
                 if code == 'P' and acquired == 'A':
                     tx_date = tx.findtext(".//transactionDate/value") or entry['date_filed']
+                    
+                    # STRICT FILTER: Discard out-of-bounds historical transactions
+                    if not (start_date_str <= tx_date <= end_date_str):
+                        continue
+                        
                     shares = float(tx.findtext(".//transactionShares/value") or 0)
                     price = float(tx.findtext(".//transactionPricePerShare/value") or 0)
                     following = float(tx.findtext(".//sharesOwnedFollowingTransaction/value") or 0)
@@ -134,30 +152,21 @@ def parse_and_insert_month(year, month, min_value=50000):
                         inserted_count += 1
             conn.commit()
         except Exception:
-            # Skip any bad formatting or connection drops gracefully
             continue
             
-        if (i + 1) % 500 == 0:
+        if (i + 1) % 200 == 0:
             print(f"Processed {i + 1}/{len(filtered_entries)} filings... Inserted {inserted_count} so far.")
 
-    print(f"-> Completed {target_prefix}! Successfully inserted {inserted_count} transactions.")
+    print(f"-> Completed period {start_date_str} to {end_date_str}! Successfully inserted {inserted_count} transactions.")
     cursor.close()
     conn.close()
 
 
 if __name__ == "__main__":
-    # Pull dynamic dates from GitHub Actions environment variables (defaulting to August 2026 if run locally)
-    start_date_str = os.environ.get("START_DATE", "2026-08-01")
-    end_date_str = os.environ.get("END_DATE", "2026-08-31")
+    start_date_str = os.environ.get("START_DATE", "2026-10-07")
+    end_date_str = os.environ.get("END_DATE", "2026-10-14")
     
-    start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
-    end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
-
-    print(f"=== Starting Historical SEC Master Index Ingestion Pipeline ===")
+    print(f"=== Starting SEC Master Index Ingestion Pipeline ===")
     print(f"Target Range: {start_date_str} to {end_date_str}")
 
-    # Loop month-by-month across the selected window
-    for dt in rrule(MONTHLY, dtstart=start_dt, until=end_dt):
-        parse_and_insert_month(dt.year, dt.month)
-
-    print("\n=== All historical backfill tasks completed successfully! ===")
+    parse_and_insert_range(start_date_str, end_date_str)
