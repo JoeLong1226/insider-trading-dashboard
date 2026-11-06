@@ -69,6 +69,31 @@ def get_sector_for_ticker(ticker, issuer_name=""):
     except Exception:
         return infer_sector_from_name(issuer_name)
 
+def assign_market_cap_tier(market_cap_val):
+    if not market_cap_val or market_cap_val <= 0:
+        return 'Unknown', None
+    # Micro/Small Cap: < $2B -> Russell 2000 (IWM)
+    if market_cap_val < 2_000_000_000:
+        return 'Micro/Small', 'IWM'
+    # Mid Cap: $2B to $10B -> S&P MidCap 400 (IJH)
+    elif 2_000_000_000 <= market_cap_val <= 10_000_000_000:
+        return 'Mid', 'IJH'
+    # Large Cap: > $10B -> S&P 500 (SPY)
+    else:
+        return 'Large', 'SPY'
+
+def get_ticker_metadata(ticker_symbol):
+    if not ticker_symbol or ticker_symbol in ['NONE', '[NONE]']:
+        return None, 'Unknown', None
+    cleaned_ticker = ticker_symbol.replace(".", "-")
+    try:
+        t = yf.Ticker(cleaned_ticker)
+        mcap = t.fast_info.market_cap
+        category, benchmark = assign_market_cap_tier(mcap)
+        return mcap, category, benchmark
+    except Exception:
+        return None, 'Unknown', None
+
 def run_market_wide_etl():
     start_date = (datetime.date.today() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')
     print(f"Fetching recent Form 4 filings from {start_date}...")
@@ -80,6 +105,7 @@ def run_market_wide_etl():
     conn = psycopg2.connect(conn_url)
     cursor = conn.cursor()
 
+    # Automatically ensure table and new columns exist
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS insider_trades (
             id SERIAL PRIMARY KEY,
@@ -91,11 +117,18 @@ def run_market_wide_etl():
             shares_bought BIGINT,
             shares_owned_following BIGINT,
             est_value NUMERIC,
+            market_cap BIGINT,
+            market_cap_category TEXT,
+            benchmark_ticker TEXT,
+            ret_stock_after NUMERIC(8,4),
+            ret_benchmark_after NUMERIC(8,4),
+            alpha_after NUMERIC(8,4),
             activity_type TEXT,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             CONSTRAINT unique_trade UNIQUE (transaction_date, ticker, insider_name, shares_bought, est_value)
         );
     """)
+    conn.commit()
 
     for filing in filings:
         try:
@@ -143,11 +176,21 @@ def run_market_wide_etl():
 
                 if est_val >= 50000 and shares > 0:
                     sector = get_sector_for_ticker(ticker, issuer_name)
+                    mcap, mcap_category, benchmark = get_ticker_metadata(ticker)
+
                     parsed_transactions.append({
-                        "transaction_date": tx_date, "ticker": ticker, "sector": sector,
-                        "insider_name": insider, "insider_title": title,
-                        "shares_bought": int(shares), "shares_owned_following": int(shares_following),
-                        "est_value": float(est_val), "activity_type": "Purchase"
+                        "transaction_date": tx_date, 
+                        "ticker": ticker, 
+                        "sector": sector,
+                        "insider_name": insider, 
+                        "insider_title": title,
+                        "shares_bought": int(shares), 
+                        "shares_owned_following": int(shares_following),
+                        "est_value": float(est_val), 
+                        "market_cap": mcap,
+                        "market_cap_category": mcap_category,
+                        "benchmark_ticker": benchmark,
+                        "activity_type": "Purchase"
                     })
         except Exception:
             continue
@@ -160,13 +203,23 @@ def run_market_wide_etl():
     print(f"Upserting {len(df_new)} validated trades into Supabase...")
     for _, row in df_new.iterrows():
         cursor.execute("""
-            INSERT INTO insider_trades (transaction_date, ticker, sector, insider_name, insider_title, shares_bought, shares_owned_following, est_value, activity_type)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO insider_trades (
+                transaction_date, ticker, sector, insider_name, insider_title, 
+                shares_bought, shares_owned_following, est_value, 
+                market_cap, market_cap_category, benchmark_ticker, activity_type
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (transaction_date, ticker, insider_name, shares_bought, est_value) 
-            DO UPDATE SET sector = EXCLUDED.sector, insider_title = EXCLUDED.insider_title;
+            DO UPDATE SET 
+                sector = EXCLUDED.sector, 
+                insider_title = EXCLUDED.insider_title,
+                market_cap = EXCLUDED.market_cap,
+                market_cap_category = EXCLUDED.market_cap_category,
+                benchmark_ticker = EXCLUDED.benchmark_ticker;
         """, (
             row["transaction_date"], row["ticker"], row["sector"], row["insider_name"], row["insider_title"],
-            row["shares_bought"], row["shares_owned_following"], row["est_value"], row["activity_type"]
+            row["shares_bought"], row["shares_owned_following"], row["est_value"],
+            row["market_cap"], row["market_cap_category"], row["benchmark_ticker"], row["activity_type"]
         ))
 
     conn.commit()
