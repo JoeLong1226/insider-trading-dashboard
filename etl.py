@@ -16,6 +16,12 @@ FUND_CIK_MAP = {
     "2032432": "BMACX", "0002032432": "BMACX",
 }
 
+TICKER_ALIASES = {
+    "LBTY": "LBTYA",
+    "GOOG": "GOOGL",
+    "BRK.B": "BRK-B",
+}
+
 def safe_bigint(val):
     """Safely convert and cap values to fit within PostgreSQL BIGINT limits."""
     try:
@@ -26,6 +32,11 @@ def safe_bigint(val):
     except Exception:
         pass
     return None
+
+def clean_ticker_for_yf(ticker):
+    if not ticker: return ticker
+    clean = ticker.replace(".", "-").upper()
+    return TICKER_ALIASES.get(clean, clean)
 
 def resolve_ticker(raw_ticker, issuer_name, issuer_cik=""):
     clean_cik = str(issuer_cik).strip().lstrip("0")
@@ -64,7 +75,7 @@ def get_sector_for_ticker(ticker, issuer_name=""):
     if ticker in ["BREC", "BPRE", "BCRED", "BMACX", "MXF"]: 
         return "Private Credit & Funds"
     
-    cleaned_ticker = ticker.replace(".", "-")
+    cleaned_ticker = clean_ticker_for_yf(ticker)
     try:
         stock = yf.Ticker(cleaned_ticker)
         info = stock.info
@@ -93,10 +104,11 @@ def assign_market_cap_tier(market_cap_val):
 def get_ticker_metadata(ticker_symbol):
     if not ticker_symbol or ticker_symbol in ['NONE', '[NONE]']:
         return None, 'Unknown', None
-    cleaned_ticker = ticker_symbol.replace(".", "-")
+    cleaned_ticker = clean_ticker_for_yf(ticker_symbol)
     try:
         t = yf.Ticker(cleaned_ticker)
-        mcap = safe_bigint(t.fast_info.market_cap)
+        # Using float conversion for market cap to prevent any integer overflow ranges
+        mcap = float(t.fast_info.market_cap) if t.fast_info.market_cap else None
         if not mcap or mcap <= 0:
             return None, 'Unknown', None
             
@@ -135,7 +147,8 @@ def run_market_wide_etl():
     """)
     
     alter_statements = [
-        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap BIGINT;",
+        "ALTER TABLE insider_trades ALTER COLUMN market_cap TYPE NUMERIC;",
+        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap NUMERIC;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap_category TEXT;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS benchmark_ticker TEXT;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS ret_stock_after NUMERIC(8,4);",
@@ -216,7 +229,7 @@ def run_market_wide_etl():
                         "shares_bought": shares, 
                         "shares_owned_following": shares_following,
                         "est_value": float(est_val), 
-                        "market_cap": mcap,
+                        "market_cap": float(mcap) if mcap else None,
                         "market_cap_category": mcap_category,
                         "benchmark_ticker": benchmark,
                         "activity_type": "Purchase"
@@ -254,9 +267,6 @@ def run_market_wide_etl():
     cursor.close()
     conn.close()
     print("ETL sync completed successfully!")
-
-if __name__ == "__main__":
-    run_market_wide_etl()
 
 if __name__ == "__main__":
     run_market_wide_etl()
