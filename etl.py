@@ -100,9 +100,10 @@ def run_market_wide_etl():
 
     conn_url = os.environ.get("SUPABASE_DB_URL")
     conn = psycopg2.connect(conn_url)
+    conn.autocommit = True  # Enable autocommit so each alter statement commits instantly
     cursor = conn.cursor()
 
-    # Ensure table exists and safely add new columns if missing
+    # Ensure base table exists
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS insider_trades (
             id SERIAL PRIMARY KEY,
@@ -120,7 +121,7 @@ def run_market_wide_etl():
         );
     """)
     
-    # Safely add columns individually to avoid timeouts
+    # Explicitly add columns one by one with autocommit
     alter_statements = [
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap BIGINT;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap_category TEXT;",
@@ -129,13 +130,13 @@ def run_market_wide_etl():
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS ret_benchmark_after NUMERIC(8,4);",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS alpha_after NUMERIC(8,4);"
     ]
+    
     for stmt in alter_statements:
         try:
             cursor.execute(stmt)
-            conn.commit()
+            print(f"Executed: {stmt}")
         except Exception as e:
-            conn.rollback()
-            print(f"Notice during alter: {e}")
+            print(f"Note on statement '{stmt}': {e}")
 
     for filing in filings:
         try:
@@ -228,7 +229,6 @@ def run_market_wide_etl():
             row["market_cap"], row["market_cap_category"], row["benchmark_ticker"], row["activity_type"]
         ))
 
-    conn.commit()
     cursor.close()
     conn.close()
     print("ETL sync completed successfully!")
