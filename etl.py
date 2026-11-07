@@ -1,9 +1,6 @@
 import os
 import re
 import datetime
-import xml.etree.ElementTree as ETimport os
-import re
-import datetime
 import xml.etree.ElementTree as ET
 import pandas as pd
 from edgar import get_filings, set_identity
@@ -90,7 +87,6 @@ def get_ticker_metadata(ticker_symbol):
         t = yf.Ticker(cleaned_ticker)
         mcap = t.fast_info.market_cap
         
-        # Guard against invalid, negative, or out-of-range bigint values (> 9 quintillion)
         if not mcap or mcap <= 0 or mcap > 9_223_372_036_854_775_807:
             return None, 'Unknown', None
             
@@ -108,10 +104,9 @@ def run_market_wide_etl():
 
     conn_url = os.environ.get("SUPABASE_DB_URL")
     conn = psycopg2.connect(conn_url)
-    conn.autocommit = True  # Ensures each migration statement commits instantly
+    conn.autocommit = True
     cursor = conn.cursor()
 
-    # Ensure base table exists
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS insider_trades (
             id SERIAL PRIMARY KEY,
@@ -129,7 +124,6 @@ def run_market_wide_etl():
         );
     """)
     
-    # Safely add the streamlined tracking columns
     alter_statements = [
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap BIGINT;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap_category TEXT;",
@@ -240,6 +234,9 @@ def run_market_wide_etl():
     cursor.close()
     conn.close()
     print("ETL sync completed successfully!")
+
+if __name__ == "__main__":
+    run_market_wide_etl()
 
 if __name__ == "__main__":
     run_market_wide_etl()
