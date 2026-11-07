@@ -16,6 +16,17 @@ FUND_CIK_MAP = {
     "2032432": "BMACX", "0002032432": "BMACX",
 }
 
+def safe_bigint(val):
+    """Safely convert and cap values to fit within PostgreSQL BIGINT limits."""
+    try:
+        if val is None: return None
+        i = int(float(val))
+        if -9_223_372_036_854_775_808 <= i <= 9_223_372_036_854_775_807:
+            return i
+    except Exception:
+        pass
+    return None
+
 def resolve_ticker(raw_ticker, issuer_name, issuer_cik=""):
     clean_cik = str(issuer_cik).strip().lstrip("0")
     if clean_cik in FUND_CIK_MAP: return FUND_CIK_MAP[clean_cik]
@@ -85,13 +96,12 @@ def get_ticker_metadata(ticker_symbol):
     cleaned_ticker = ticker_symbol.replace(".", "-")
     try:
         t = yf.Ticker(cleaned_ticker)
-        mcap = t.fast_info.market_cap
-        
-        if not mcap or mcap <= 0 or mcap > 9_223_372_036_854_775_807:
+        mcap = safe_bigint(t.fast_info.market_cap)
+        if not mcap or mcap <= 0:
             return None, 'Unknown', None
             
         category, benchmark = assign_market_cap_tier(mcap)
-        return int(mcap), category, benchmark
+        return mcap, category, benchmark
     except Exception:
         return None, 'Unknown', None
 
@@ -176,14 +186,24 @@ def run_market_wide_etl():
                 code_elem = tx.find(".//transactionCoding/transactionCode")
                 if code_elem is None or code_elem.text != "P": continue
 
-                shares = float(tx.findtext(".//transactionAmounts/transactionShares/value", "0"))
-                price = float(tx.findtext(".//transactionAmounts/transactionPricePerShare/value", "0"))
+                shares_raw = tx.findtext(".//transactionAmounts/transactionShares/value", "0")
+                price_raw = tx.findtext(".//transactionAmounts/transactionPricePerShare/value", "0")
+                shares_following_raw = tx.findtext(".//postTransactionAmounts/sharesOwnedFollowingTransaction/value", "0")
+
+                shares = safe_bigint(shares_raw)
+                if not shares or shares <= 0: continue
+
+                try:
+                    price = float(price_raw)
+                except Exception:
+                    price = 0.0
+
+                shares_following = safe_bigint(shares_following_raw) or 0
                 tx_date = tx.findtext(".//transactionDate/value", str(filing.filing_date))
-                shares_following = float(tx.findtext(".//postTransactionAmounts/sharesOwnedFollowingTransaction/value", "0"))
 
                 est_val = shares * price
 
-                if est_val >= 50000 and shares > 0:
+                if est_val >= 50000:
                     sector = get_sector_for_ticker(ticker, issuer_name)
                     mcap, mcap_category, benchmark = get_ticker_metadata(ticker)
 
@@ -193,8 +213,8 @@ def run_market_wide_etl():
                         "sector": sector,
                         "insider_name": insider, 
                         "insider_title": title,
-                        "shares_bought": int(shares), 
-                        "shares_owned_following": int(shares_following),
+                        "shares_bought": shares, 
+                        "shares_owned_following": shares_following,
                         "est_value": float(est_val), 
                         "market_cap": mcap,
                         "market_cap_category": mcap_category,
