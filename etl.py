@@ -1,6 +1,9 @@
 import os
 import re
 import datetime
+import xml.etree.ElementTree as ETimport os
+import re
+import datetime
 import xml.etree.ElementTree as ET
 import pandas as pd
 from edgar import get_filings, set_identity
@@ -86,8 +89,13 @@ def get_ticker_metadata(ticker_symbol):
     try:
         t = yf.Ticker(cleaned_ticker)
         mcap = t.fast_info.market_cap
+        
+        # Guard against invalid, negative, or out-of-range bigint values (> 9 quintillion)
+        if not mcap or mcap <= 0 or mcap > 9_223_372_036_854_775_807:
+            return None, 'Unknown', None
+            
         category, benchmark = assign_market_cap_tier(mcap)
-        return mcap, category, benchmark
+        return int(mcap), category, benchmark
     except Exception:
         return None, 'Unknown', None
 
@@ -121,7 +129,7 @@ def run_market_wide_etl():
         );
     """)
     
-    # Safely add the streamlined tracking columns now that the table is unlocked
+    # Safely add the streamlined tracking columns
     alter_statements = [
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap BIGINT;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap_category TEXT;",
