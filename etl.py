@@ -100,7 +100,7 @@ def run_market_wide_etl():
 
     conn_url = os.environ.get("SUPABASE_DB_URL")
     conn = psycopg2.connect(conn_url)
-    conn.autocommit = True  # Enable autocommit so each alter statement commits instantly
+    conn.autocommit = True  # Ensures each migration statement commits instantly
     cursor = conn.cursor()
 
     # Ensure base table exists
@@ -121,7 +121,7 @@ def run_market_wide_etl():
         );
     """)
     
-    # Explicitly add columns one by one with autocommit
+    # Safely add the streamlined tracking columns now that the table is unlocked
     alter_statements = [
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap BIGINT;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap_category TEXT;",
