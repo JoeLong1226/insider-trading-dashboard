@@ -72,13 +72,10 @@ def get_sector_for_ticker(ticker, issuer_name=""):
 def assign_market_cap_tier(market_cap_val):
     if not market_cap_val or market_cap_val <= 0:
         return 'Unknown', None
-    # Micro/Small Cap: < $2B -> Russell 2000 (IWM)
     if market_cap_val < 2_000_000_000:
         return 'Micro/Small', 'IWM'
-    # Mid Cap: $2B to $10B -> S&P MidCap 400 (IJH)
     elif 2_000_000_000 <= market_cap_val <= 10_000_000_000:
         return 'Mid', 'IJH'
-    # Large Cap: > $10B -> S&P 500 (SPY)
     else:
         return 'Large', 'SPY'
 
@@ -105,7 +102,7 @@ def run_market_wide_etl():
     conn = psycopg2.connect(conn_url)
     cursor = conn.cursor()
 
-    # Automatically ensure table and new columns exist
+    # Ensure table exists and safely add new columns if missing
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS insider_trades (
             id SERIAL PRIMARY KEY,
@@ -117,18 +114,28 @@ def run_market_wide_etl():
             shares_bought BIGINT,
             shares_owned_following BIGINT,
             est_value NUMERIC,
-            market_cap BIGINT,
-            market_cap_category TEXT,
-            benchmark_ticker TEXT,
-            ret_stock_after NUMERIC(8,4),
-            ret_benchmark_after NUMERIC(8,4),
-            alpha_after NUMERIC(8,4),
             activity_type TEXT,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             CONSTRAINT unique_trade UNIQUE (transaction_date, ticker, insider_name, shares_bought, est_value)
         );
     """)
-    conn.commit()
+    
+    # Safely add columns individually to avoid timeouts
+    alter_statements = [
+        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap BIGINT;",
+        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap_category TEXT;",
+        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS benchmark_ticker TEXT;",
+        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS ret_stock_after NUMERIC(8,4);",
+        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS ret_benchmark_after NUMERIC(8,4);",
+        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS alpha_after NUMERIC(8,4);"
+    ]
+    for stmt in alter_statements:
+        try:
+            cursor.execute(stmt)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"Notice during alter: {e}")
 
     for filing in filings:
         try:
@@ -145,7 +152,6 @@ def run_market_wide_etl():
 
             insider = root.findtext(".//reportingOwner/reportingOwnerId/rptOwnerName", "Insider Trader")
             
-            # Smart Title Parsing
             rel = root.find(".//reportingOwner/reportingOwnerRelationship")
             title = ""
             if rel is not None:
