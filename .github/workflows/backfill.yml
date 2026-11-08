@@ -1,26 +1,36 @@
-name: Run Historical Ingestion
+name: backfill
 
 on:
   workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Start Date (YYYY-MM-DD)'
+        required: true
+        default: '2026-05-01'
+        type: string
+      end_date:
+        description: 'End Date (YYYY-MM-DD)'
+        required: true
+        default: '2026-05-03'
+        type: string
 
 jobs:
-  ingest:
+  run-backfill:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
-      - name: Run Ingestion Script
+      - name: Run ETL Script
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
-          python backfill_mcap.py
+          python etl.py "${{ github.event.inputs.start_date }}" "${{ github.event.inputs.end_date }}"
