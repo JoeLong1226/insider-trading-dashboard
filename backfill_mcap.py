@@ -1,94 +1,93 @@
 import os
 import time
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 import psycopg2
 import requests
 import xml.etree.ElementTree as ET
 import yfinance as yf
+import pandas as pd
 
 HEADERS = {'User-Agent': 'InsiderTradingApp admin@example.com'}
 SUPABASE_URL = os.environ.get("SUPABASE_DB_URL")
-
 
 def get_db_connection():
     if not SUPABASE_URL:
         raise ValueError("Missing database connection string. Set SUPABASE_DB_URL.")
     return psycopg2.connect(SUPABASE_URL)
 
-
-sector_cache = {
-    "AON": "Financial Services",
-    "AAPL": "Technology",
-    "MSFT": "Technology",
-    "AMZN": "Consumer Cyclical",
-    "GOOGL": "Communication Services"
+TICKER_ALIASES = {
+    "LBTY": "LBTYA",
+    "GOOG": "GOOGL",
+    "BRK.B": "BRK-B",
 }
 
+def clean_ticker_for_yf(ticker):
+    if not ticker: return ticker
+    clean = ticker.strip().upper()
+    if ":" in clean: clean = clean.split(":")[-1].strip()
+    clean = re.sub(r'[\[\]\s]', '', clean)
+    if "," in clean: clean = clean.split(",")[0].strip()
+    elif "/" in clean: clean = clean.split("/")[0].strip()
+    return TICKER_ALIASES.get(clean, clean)
 
-def infer_sector_from_name(company_name):
-    name = company_name.upper()
-    if any(k in name for k in ["TOURISM", "ENTERTAINMENT", "HOTEL", "RESORT", "RESTAURANT", "TRAVEL"]):
-        return "Consumer Cyclical"
-    if any(k in name for k in ["ENERGY", "OIL", "GAS", "POWER", "ELECTRIC"]):
-        return "Utilities"
-    if any(k in name for k in ["PHARMA", "HEALTH", "BIOTECH", "MEDICAL", "THERAPEUTICS"]):
-        return "Healthcare"
-    if any(k in name for k in ["BANK", "FINANCIAL", "CAPITAL", "INVESTMENT", "FUND"]):
-        return "Financial Services"
-    if any(k in name for k in ["TECH", "SOFTWARE", "SYSTEMS", "SOLUTIONS"]):
-        return "Technology"
-    if any(k in name for k in ["GOLD", "MINING", "RESOURCES", "METALS"]):
-        return "Basic Materials"
-    return "General Equity"
-
-
-def get_sector_for_ticker(ticker, company_name=""):
-    if not ticker or ticker in ("NONE", "UNKNOWN", "N/A", "NULL"):
-        return infer_sector_from_name(company_name)
-     
-    clean_ticker = ticker.strip().upper()
-     
-    # Clean up exchange prefixes like "NYSE: VTEX" -> "VTEX"
-    if ":" in clean_ticker:
-        clean_ticker = clean_ticker.split(":")[-1].strip()
-         
-    # Strip brackets, unwanted spaces, or weird formatting
-    clean_ticker = re.sub(r'[\[\]\s]', '', clean_ticker)
-     
-    # Handle dual-class / multi-ticker formatting like "HEI, HEI.A" -> "HEI"
-    if "," in clean_ticker:
-        clean_ticker = clean_ticker.split(",")[0].strip()
-    elif "/" in clean_ticker:
-        clean_ticker = clean_ticker.split("/")[0].strip()
-
-    if clean_ticker in ("NYSE", "NASDAQ", "AMEX", "ARCX", "OTC", ""):
-        return infer_sector_from_name(company_name)
-
-    if clean_ticker in sector_cache:
-        return sector_cache[clean_ticker]
-     
-    candidates = [clean_ticker]
-    if re.search(r'\d+\$', clean_ticker):
-        candidates.append(f"{clean_ticker}.SA")
+def assign_market_cap_tier(market_cap_val):
+    if not market_cap_val or market_cap_val <= 0:
+        return 'Unknown', None
+    if market_cap_val < 2_000_000_000:
+        return 'Micro/Small', 'IWM'
+    elif 2_000_000_000 <= market_cap_val <= 10_000_000_000:
+        return 'Mid', 'IJH'
     else:
-        candidates.append(f"{clean_ticker}.PK")
-         
-    for sym in candidates:
-        try:
-            tk = yf.Ticker(sym)
-            info = tk.info
-            sector = info.get("sector") or info.get("industry")
-            if sector:
-                sector_cache[clean_ticker] = sector
-                return sector
-        except Exception:
-            continue
-         
-    fallback_sector = infer_sector_from_name(company_name)
-    sector_cache[clean_ticker] = fallback_sector
-    return fallback_sector
+        return 'Large', 'SPY'
 
+def get_point_in_time_metadata(ticker_symbol, tx_date_str):
+    if not ticker_symbol or ticker_symbol in ['NONE', '[NONE]', 'UNKNOWN', 'N/A']:
+        return None, 'Unknown', None
+    
+    cleaned_ticker = clean_ticker_for_yf(ticker_symbol)
+    try:
+        tx_date = datetime.strptime(tx_date_str.strip(), '%Y-%m-%d').date()
+        start_date = tx_date - timedelta(days=5)
+        end_date = tx_date + timedelta(days=5)
+
+        t = yf.Ticker(cleaned_ticker)
+        hist = t.history(start=str(start_date), end=str(end_date))
+        
+        if hist.empty or 'Close' not in hist.columns:
+            return None, 'Unknown', None
+            
+        hist.index = hist.index.date
+        if tx_date in hist.index:
+            price = float(hist.loc[tx_date, 'Close'])
+        else:
+            hist['diff'] = abs(pd.to_datetime(hist.index) - pd.to_datetime(tx_date))
+            price = float(hist.loc[hist['diff'].idxmin(), 'Close'])
+
+        shares = None
+        try:
+            bs = t.quarterly_balance_sheet
+            if bs is not None and not bs.empty:
+                share_rows = [r for r in bs.index if 'Share' in str(r) or 'Ordinary' in str(r)]
+                if share_rows:
+                    valid_cols = [(c, pd.to_datetime(c).date()) for c in bs.columns if pd.to_datetime(c).date() <= tx_date]
+                    if valid_cols:
+                        valid_cols.sort(key=lambda x: x[1], reverse=True)
+                        shares = float(bs.loc[share_rows[0], valid_cols[0][0]])
+        except Exception:
+            pass
+
+        if not shares or shares <= 0:
+            shares = float(t.fast_info.shares) if t.fast_info.shares else None
+
+        if not shares or shares <= 0:
+            return None, 'Unknown', None
+
+        historical_mcap = price * shares
+        category, benchmark = assign_market_cap_tier(historical_mcap)
+        return historical_mcap, category, benchmark
+    except Exception:
+        return None, 'Unknown', None
 
 def fetch_quarterly_index(year, quarter):
     url = f"https://www.sec.gov/Archives/edgar/full-index/{year}/QTR{quarter}/master.idx"
@@ -99,7 +98,6 @@ def fetch_quarterly_index(year, quarter):
 
     lines = response.text.split('\n')
     form4_entries = []
-     
     data_started = False
     for line in lines:
         if "CIK|Company Name|Form Type|Date Filed|Filename" in line:
@@ -116,70 +114,81 @@ def fetch_quarterly_index(year, quarter):
                 })
     return form4_entries
 
-
 def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
     start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
-     
+    
     qtr = (start_dt.month - 1) // 3 + 1
     print(f"--- Fetching QTR {qtr} index for {start_dt.year} ({start_date_str} to {end_date_str}) ---")
-     
+    
     all_entries = fetch_quarterly_index(start_dt.year, qtr)
-     
-    filtered_entries = [
-        e for e in all_entries 
-        if start_date_str <= e['date_filed'] <= end_date_str
-    ]
+    filtered_entries = [e for e in all_entries if start_date_str <= e['date_filed'] <= end_date_str]
     print(f"Found {len(filtered_entries)} Form 4 filings for target period. Starting ingestion...")
 
     conn = get_db_connection()
     cursor = conn.cursor()
-     
+
+    # Ensure columns exist
+    for stmt in [
+        "ALTER TABLE insider_trades ALTER COLUMN market_cap TYPE NUMERIC;",
+        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap NUMERIC;",
+        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap_category TEXT;",
+        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS benchmark_ticker TEXT;"
+    ]:
+        try: cursor.execute(stmt); conn.commit()
+        except Exception: pass
+    
     insert_query = """
-        INSERT INTO insider_trades (transaction_date, ticker, sector, insider_name, insider_title, shares_bought, shares_owned_following, est_value, activity_type)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT DO NOTHING;
+        INSERT INTO insider_trades (
+            transaction_date, ticker, sector, insider_name, insider_title, 
+            shares_bought, shares_owned_following, est_value, activity_type,
+            market_cap, market_cap_category, benchmark_ticker
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (transaction_date, ticker, insider_name, shares_bought, est_value) 
+        DO UPDATE SET 
+            market_cap = EXCLUDED.market_cap,
+            market_cap_category = EXCLUDED.market_cap_category,
+            benchmark_ticker = EXCLUDED.benchmark_ticker;
     """
-     
+    
     inserted_count = 0
     for i, entry in enumerate(filtered_entries):
         txt_url = f"https://www.sec.gov/Archives/{entry['filename']}"
         time.sleep(0.12)
-         
+        
         try:
             res = requests.get(txt_url, headers=HEADERS, timeout=10)
             if res.status_code != 200 or "<xml>" not in res.text.lower():
                 continue
-                 
+                
             xml_start = res.text.find("<XML>")
             xml_end = res.text.find("</XML>")
             if xml_start == -1 or xml_end == -1:
                 continue
-                 
+                
             xml_content = res.text[xml_start+5:xml_end].strip()
             root = ET.fromstring(xml_content)
-             
+            
             ticker = "NONE"
             for tag in [".//issuerTradingSymbol", ".//tradingSymbol", ".//symbol"]:
                 found = root.findtext(tag)
                 if found and found.strip() and found.strip().upper() not in ["NONE", "N/A", "NULL", ""]:
                     ticker = found.strip().upper()
                     break
-             
+            
             company_name = entry.get('company', '')
             insider = root.findtext(".//rptOwnerName") or "UNKNOWN"
             title = root.findtext(".//officerTitle") or "Director/Other"
-            sector = get_sector_for_ticker(ticker, company_name)
-             
+            
             for tx in root.findall(".//nonDerivativeTransaction"):
                 code = tx.findtext(".//transactionCoding/transactionCode")
                 acquired = tx.findtext(".//transactionAmounts/transactionAcquiredDisposedCode/value")
-                 
+                
                 if code == 'P' and acquired == 'A':
                     tx_date = tx.findtext(".//transactionDate/value")
-                    if not tx_date:
-                        continue
-                         
+                    if not tx_date: continue
+                        
                     shares_str = tx.findtext(".//transactionShares/value")
                     shares = float(shares_str) if shares_str else 0.0
                     
@@ -187,34 +196,34 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
                     price = float(price_str) if price_str else 0.0
                     
                     est_val = shares * price
-                    if est_val < min_value:
-                        continue
-                         
+                    if est_val < 50000: continue
+                        
                     owned_str = tx.findtext(".//sharesOwnedFollowingTransaction/value")
                     owned = float(owned_str) if owned_str else 0.0
                     
+                    # Compute point-in-time market cap
+                    mcap, category, benchmark = get_point_in_time_metadata(ticker, tx_date)
+                    
                     try:
                         cursor.execute(insert_query, (
-                            tx_date, ticker, sector, insider, title, shares, owned, est_val, "BUY"
+                            tx_date, ticker, "General Equity", insider, title, shares, owned, est_val, "BUY",
+                            float(mcap) if mcap else None, category, benchmark
                         ))
                         conn.commit()
                         inserted_count += 1
                     except Exception as db_err:
                         conn.rollback()
                         print(f"DB Insert Error: {db_err}")
-                        
         except Exception:
             continue
 
     cursor.close()
     conn.close()
-    print(f"--- Finished backfill. Inserted {inserted_count} records. ---")
-
+    print(f"--- Finished backfill. Inserted/Updated {inserted_count} records. ---")
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) >= 3:
         parse_and_insert_range(sys.argv[1], sys.argv[2])
     else:
-        # Default test range
         parse_and_insert_range("2026-11-01", "2026-11-05")
