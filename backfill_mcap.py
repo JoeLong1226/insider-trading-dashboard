@@ -89,46 +89,11 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
     except Exception:
         return None, 'Unknown', None
 
-def fetch_quarterly_index(year, quarter):
-    url = f"https://www.sec.gov/Archives/edgar/full-index/{year}/QTR{quarter}/master.idx"
-    response = requests.get(url, headers=HEADERS, timeout=15)
-    if response.status_code != 200:
-        print(f"Failed to fetch index for {year} Q{quarter}: Status {response.status_code}")
-        return []
-
-    lines = response.text.split('\n')
-    form4_entries = []
-    data_started = False
-    for line in lines:
-        if "CIK|Company Name|Form Type|Date Filed|Filename" in line:
-            data_started = True
-            continue
-        if data_started and line.strip():
-            parts = line.split('|')
-            if len(parts) == 5 and parts[2] == '4':
-                form4_entries.append({
-                    'cik': parts[0],
-                    'company': parts[1],
-                    'date_filed': parts[3],
-                    'filename': parts[4].strip()
-                })
-    return form4_entries
-
-def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
-    start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
-    end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
-    
-    qtr = (start_dt.month - 1) // 3 + 1
-    print(f"--- Fetching QTR {qtr} index for {start_dt.year} ({start_date_str} to {end_date_str}) ---")
-    
-    all_entries = fetch_quarterly_index(start_dt.year, qtr)
-    filtered_entries = [e for e in all_entries if start_date_str <= e['date_filed'] <= end_date_str]
-    print(f"Found {len(filtered_entries)} Form 4 filings for target period. Starting ingestion...")
-
+def backfill_missing_market_caps():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Ensure columns exist
+    # Ensure columns exist in Supabase
     for stmt in [
         "ALTER TABLE insider_trades ALTER COLUMN market_cap TYPE NUMERIC;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap NUMERIC;",
@@ -137,93 +102,41 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
     ]:
         try: cursor.execute(stmt); conn.commit()
         except Exception: pass
-    
-    insert_query = """
-        INSERT INTO insider_trades (
-            transaction_date, ticker, sector, insider_name, insider_title, 
-            shares_bought, shares_owned_following, est_value, activity_type,
-            market_cap, market_cap_category, benchmark_ticker
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (transaction_date, ticker, insider_name, shares_bought, est_value) 
-        DO UPDATE SET 
-            market_cap = EXCLUDED.market_cap,
-            market_cap_category = EXCLUDED.market_cap_category,
-            benchmark_ticker = EXCLUDED.benchmark_ticker;
-    """
-    
-    inserted_count = 0
-    for i, entry in enumerate(filtered_entries):
-        txt_url = f"https://www.sec.gov/Archives/{entry['filename']}"
-        time.sleep(0.12)
+
+    # Fetch rows where market cap hasn't been calculated yet
+    cursor.execute("""
+        SELECT id, transaction_date, ticker 
+        FROM insider_trades 
+        WHERE market_cap IS NULL AND transaction_date is not null;
+    """)
+    rows = cursor.fetchall()
+    print(f"Found {len(rows)} records needing point-in-time market cap backfill.")
+
+    updated_count = 0
+    for row in rows:
+        trade_id, tx_date_str, ticker = row
+        if not ticker: continue
+
+        mcap, category, benchmark = get_point_in_time_metadata(ticker, tx_date_str)
+        if mcap:
+            try:
+                cursor.execute("""
+                    UPDATE insider_trades 
+                    SET market_cap = %s, market_cap_category = %s, benchmark_ticker = %s
+                    WHERE id = %s;
+                """, (float(mcap), category, benchmark, trade_id))
+                conn.commit()
+                updated_count += 1
+                print(f"Updated ID {trade_id} | {ticker} on {tx_date_str}: MCap = ${mcap:,.0f} [{category}]")
+            except Exception as db_err:
+                conn.rollback()
+                print(f"DB Update Error for ID {trade_id}: {db_err}")
         
-        try:
-            res = requests.get(txt_url, headers=HEADERS, timeout=10)
-            if res.status_code != 200 or "<xml>" not in res.text.lower():
-                continue
-                
-            xml_start = res.text.find("<XML>")
-            xml_end = res.text.find("</XML>")
-            if xml_start == -1 or xml_end == -1:
-                continue
-                
-            xml_content = res.text[xml_start+5:xml_end].strip()
-            root = ET.fromstring(xml_content)
-            
-            ticker = "NONE"
-            for tag in [".//issuerTradingSymbol", ".//tradingSymbol", ".//symbol"]:
-                found = root.findtext(tag)
-                if found and found.strip() and found.strip().upper() not in ["NONE", "N/A", "NULL", ""]:
-                    ticker = found.strip().upper()
-                    break
-            
-            company_name = entry.get('company', '')
-            insider = root.findtext(".//rptOwnerName") or "UNKNOWN"
-            title = root.findtext(".//officerTitle") or "Director/Other"
-            
-            for tx in root.findall(".//nonDerivativeTransaction"):
-                code = tx.findtext(".//transactionCoding/transactionCode")
-                acquired = tx.findtext(".//transactionAmounts/transactionAcquiredDisposedCode/value")
-                
-                if code == 'P' and acquired == 'A':
-                    tx_date = tx.findtext(".//transactionDate/value")
-                    if not tx_date: continue
-                        
-                    shares_str = tx.findtext(".//transactionShares/value")
-                    shares = float(shares_str) if shares_str else 0.0
-                    
-                    price_str = tx.findtext(".//transactionPricePerShare/value")
-                    price = float(price_str) if price_str else 0.0
-                    
-                    est_val = shares * price
-                    if est_val < 50000: continue
-                        
-                    owned_str = tx.findtext(".//sharesOwnedFollowingTransaction/value")
-                    owned = float(owned_str) if owned_str else 0.0
-                    
-                    # Compute point-in-time market cap
-                    mcap, category, benchmark = get_point_in_time_metadata(ticker, tx_date)
-                    
-                    try:
-                        cursor.execute(insert_query, (
-                            tx_date, ticker, "General Equity", insider, title, shares, owned, est_val, "BUY",
-                            float(mcap) if mcap else None, category, benchmark
-                        ))
-                        conn.commit()
-                        inserted_count += 1
-                    except Exception as db_err:
-                        conn.rollback()
-                        print(f"DB Insert Error: {db_err}")
-        except Exception:
-            continue
+        time.sleep(0.1)
 
     cursor.close()
     conn.close()
-    print(f"--- Finished backfill. Inserted/Updated {inserted_count} records. ---")
+    print(f"--- Finished Market Cap Backfill. Successfully updated {updated_count} records. ---")
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) >= 3:
-        parse_and_insert_range(sys.argv[1], sys.argv[2])
-    else:
-        parse_and_insert_range("2026-11-01", "2026-11-05")
+    backfill_missing_market_caps()
