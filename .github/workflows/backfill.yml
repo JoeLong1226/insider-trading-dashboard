@@ -33,4 +33,4 @@ jobs:
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
-          python etl.py "${{ github.event.inputs.start_date }}" "${{ github.event.inputs.end_date }}"
+          python backfill_mcap.py "${{ github.event.inputs.start_date }}" "${{ github.event.inputs.end_date }}"
