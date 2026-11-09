@@ -107,7 +107,6 @@ def get_ticker_metadata(ticker_symbol):
     cleaned_ticker = clean_ticker_for_yf(ticker_symbol)
     try:
         t = yf.Ticker(cleaned_ticker)
-        # Using float conversion for market cap to prevent any integer overflow ranges
         mcap = float(t.fast_info.market_cap) if t.fast_info.market_cap else None
         if not mcap or mcap <= 0:
             return None, 'Unknown', None
@@ -117,11 +116,19 @@ def get_ticker_metadata(ticker_symbol):
     except Exception:
         return None, 'Unknown', None
 
-def run_market_wide_etl():
-    start_date = (datetime.date.today() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')
-    print(f"Fetching recent Form 4 filings from {start_date}...")
+def run_market_wide_etl(start_date=None, end_date=None):
+    if start_date and end_date:
+        date_query = f"{start_date}:{end_date}"
+        print(f"Fetching Form 4 filings for date range: {date_query}...")
+    elif start_date:
+        date_query = f"{start_date}:"
+        print(f"Fetching Form 4 filings from {start_date} onwards...")
+    else:
+        start_date = (datetime.date.today() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')
+        date_query = f"{start_date}:"
+        print(f"Fetching recent Form 4 filings from {start_date}...")
 
-    filings = get_filings(form="4", filing_date=f"{start_date}:")
+    filings = get_filings(form="4", filing_date=date_query)
     parsed_transactions = []
 
     conn_url = os.environ.get("SUPABASE_DB_URL")
@@ -269,4 +276,10 @@ def run_market_wide_etl():
     print("ETL sync completed successfully!")
 
 if __name__ == "__main__":
-    run_market_wide_etl()
+    import sys
+    if len(sys.argv) >= 3:
+        run_market_wide_etl(start_date=sys.argv[1], end_date=sys.argv[2])
+    elif len(sys.argv) == 2:
+        run_market_wide_etl(start_date=sys.argv[1])
+    else:
+        run_market_wide_etl()
