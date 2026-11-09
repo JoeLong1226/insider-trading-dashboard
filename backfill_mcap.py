@@ -18,13 +18,14 @@ def get_db_connection():
     return psycopg2.connect(SUPABASE_URL)
 
 
-# --- SECTOR LOGIC ---
+# --- SECTOR & INDUSTRY MAPPING ---
 sector_cache = {
     "AON": "Financial Services",
     "AAPL": "Technology",
     "MSFT": "Technology",
     "AMZN": "Consumer Cyclical",
-    "GOOGL": "Communication Services"
+    "GOOGL": "Communication Services",
+    "ATEC": "Healthcare"
 }
 
 
@@ -32,15 +33,15 @@ def infer_sector_from_name(company_name):
     name = company_name.upper()
     if any(k in name for k in ["TOURISM", "ENTERTAINMENT", "HOTEL", "RESORT", "RESTAURANT", "TRAVEL"]):
         return "Consumer Cyclical"
-    if any(k in name for k in ["ENERGY", "OIL", "GAS", "POWER", "ELECTRIC"]):
+    if any(k in name for k in ["ENERGY", "OIL", "GAS", "POWER", "ELECTRIC", "UTILITY"]):
         return "Utilities"
-    if any(k in name for k in ["PHARMA", "HEALTH", "BIOTECH", "MEDICAL", "THERAPEUTICS"]):
+    if any(k in name for k in ["PHARMA", "HEALTH", "BIOTECH", "MEDICAL", "THERAPEUTIC", "SURGICAL", "SPINE", "DEVICE", "CLINIC", "BIOSCIENCES"]):
         return "Healthcare"
-    if any(k in name for k in ["BANK", "FINANCIAL", "CAPITAL", "INVESTMENT", "FUND"]):
+    if any(k in name for k in ["BANK", "FINANCIAL", "CAPITAL", "INVESTMENT", "FUND", "BANCORP"]):
         return "Financial Services"
-    if any(k in name for k in ["TECH", "SOFTWARE", "SYSTEMS", "SOLUTIONS"]):
+    if any(k in name for k in ["TECH", "SOFTWARE", "SYSTEMS", "SOLUTIONS", "SEMICONDUCTOR", "NETWORKS"]):
         return "Technology"
-    if any(k in name for k in ["GOLD", "MINING", "RESOURCES", "METALS"]):
+    if any(k in name for k in ["GOLD", "MINING", "RESOURCES", "METALS", "STEEL"]):
         return "Basic Materials"
     return "General Equity"
 
@@ -69,7 +70,7 @@ def get_sector_for_ticker(ticker, company_name=""):
     return fallback_sector
 
 
-# --- MARKET CAP & CACHING LOGIC ---
+# --- MARKET CAP & CLEANING LOGIC ---
 TICKER_ALIASES = {
     "LBTY": "LBTYA",
     "GOOG": "GOOGL",
@@ -97,12 +98,12 @@ def assign_market_cap_tier(market_cap_val):
         return 'Large', 'SPY'
 
 
-# In-memory run cache so we NEVER query Yahoo Finance twice for the same ticker in a single run
+# In-memory run cache so we never query Yahoo Finance twice for the same ticker+month
 mcap_cache = {}
 
 def get_point_in_time_metadata(ticker_symbol, tx_date_str):
     cleaned_ticker = clean_ticker_for_yf(ticker_symbol)
-    cache_key = f"{cleaned_ticker}_{tx_date_str[:7]}" # Cache by ticker and month
+    cache_key = f"{cleaned_ticker}_{tx_date_str[:7]}"
     if cache_key in mcap_cache:
         return mcap_cache[cache_key]
 
@@ -112,8 +113,9 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
         end_date = tx_date + timedelta(days=5)
 
         t = yf.Ticker(cleaned_ticker)
-        hist = t.history(start=str(start_date), end=str(end_date))
         
+        # 1. Get historical close price
+        hist = t.history(start=str(start_date), end=str(end_date))
         if hist.empty or 'Close' not in hist.columns:
             mcap_cache[cache_key] = (None, 'Unknown', None)
             return None, 'Unknown', None
@@ -125,19 +127,16 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
             hist['diff'] = abs(pd.to_datetime(hist.index) - pd.to_datetime(tx_date))
             price = float(hist.loc[hist['diff'].idxmin(), 'Close'])
 
+        # 2. Get historical share count using built-in yfinance method (clean & scaling-safe)
         shares = None
         try:
-            bs = t.quarterly_balance_sheet
-            if bs is not None and not bs.empty:
-                share_rows = [r for r in bs.index if 'Share' in str(r) or 'Ordinary' in str(r)]
-                if share_rows:
-                    valid_cols = [(c, pd.to_datetime(c).date()) for c in bs.columns if pd.to_datetime(c).date() <= tx_date]
-                    if valid_cols:
-                        valid_cols.sort(key=lambda x: x[1], reverse=True)
-                        shares = float(bs.loc[share_rows[0], valid_cols[0][0]])
+            shares_df = t.get_shares_full(start=str(tx_date - timedelta(days=180)), end=str(tx_date))
+            if shares_df is not None and not shares_df.empty:
+                shares = float(shares_df.iloc[-1])
         except Exception:
             pass
 
+        # 3. Fallback to fast_info if historical share series isn't available
         if not shares or shares <= 0:
             try:
                 shares = float(t.fast_info.shares) if t.fast_info.shares else None
