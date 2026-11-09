@@ -1,4 +1,4 @@
-import os
+import osimport os
 import time
 import re
 from datetime import datetime, timedelta
@@ -24,8 +24,7 @@ sector_cache = {
     "AAPL": "Technology",
     "MSFT": "Technology",
     "AMZN": "Consumer Cyclical",
-    "GOOGL": "Communication Services",
-    "ATEC": "Healthcare"
+    "GOOGL": "Communication Services"
 }
 
 
@@ -65,6 +64,16 @@ def get_sector_for_ticker(ticker, company_name=""):
     if clean_ticker in sector_cache:
         return sector_cache[clean_ticker]
      
+    # Query live Yahoo Finance info for official sector classification
+    try:
+        t = yf.Ticker(clean_ticker)
+        yf_sector = t.info.get('sector')
+        if yf_sector and yf_sector.strip():
+            sector_cache[clean_ticker] = yf_sector
+            return yf_sector
+    except Exception:
+        pass
+
     fallback_sector = infer_sector_from_name(company_name)
     sector_cache[clean_ticker] = fallback_sector
     return fallback_sector
