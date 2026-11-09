@@ -16,11 +16,35 @@ def get_db_connection():
         raise ValueError("Missing database connection string. Set SUPABASE_DB_URL.")
     return psycopg2.connect(SUPABASE_URL)
 
+sector_cache = {
+    "AON": "Financial Services",
+    "AAPL": "Technology",
+    "MSFT": "Technology",
+    "AMZN": "Consumer Cyclical",
+    "GOOGL": "Communication Services"
+}
+
 TICKER_ALIASES = {
     "LBTY": "LBTYA",
     "GOOG": "GOOGL",
     "BRK.B": "BRK-B",
 }
+
+def infer_sector_from_name(company_name):
+    name = company_name.upper()
+    if any(k in name for k in ["TOURISM", "ENTERTAINMENT", "HOTEL", "RESORT", "RESTAURANT", "TRAVEL"]):
+        return "Consumer Cyclical"
+    if any(k in name for k in ["ENERGY", "OIL", "GAS", "POWER", "ELECTRIC"]):
+        return "Utilities"
+    if any(k in name for k in ["PHARMA", "HEALTH", "BIOTECH", "MEDICAL", "THERAPEUTICS"]):
+        return "Healthcare"
+    if any(k in name for k in ["BANK", "FINANCIAL", "CAPITAL", "INVESTMENT", "FUND"]):
+        return "Financial Services"
+    if any(k in name for k in ["TECH", "SOFTWARE", "SYSTEMS", "SOLUTIONS"]):
+        return "Technology"
+    if any(k in name for k in ["GOLD", "MINING", "RESOURCES", "METALS"]):
+        return "Basic Materials"
+    return "General Equity"
 
 def clean_ticker_for_yf(ticker):
     if not ticker: return ticker
@@ -30,6 +54,38 @@ def clean_ticker_for_yf(ticker):
     if "," in clean: clean = clean.split(",")[0].strip()
     elif "/" in clean: clean = clean.split("/")[0].strip()
     return TICKER_ALIASES.get(clean, clean)
+
+def get_sector_for_ticker(ticker, company_name=""):
+    if not ticker or ticker in ("NONE", "UNKNOWN", "N/A", "NULL"):
+        return infer_sector_from_name(company_name)
+     
+    clean_ticker = clean_ticker_for_yf(ticker)
+    if clean_ticker in ("NYSE", "NASDAQ", "AMEX", "ARCX", "OTC", ""):
+        return infer_sector_from_name(company_name)
+
+    if clean_ticker in sector_cache:
+        return sector_cache[clean_ticker]
+     
+    candidates = [clean_ticker]
+    if re.search(r'\d+\$', clean_ticker):
+        candidates.append(f"{clean_ticker}.SA")
+    else:
+        candidates.append(f"{clean_ticker}.PK")
+         
+    for sym in candidates:
+        try:
+            tk = yf.Ticker(sym)
+            info = tk.info
+            sector = info.get("sector") or info.get("industry")
+            if sector:
+                sector_cache[clean_ticker] = sector
+                return sector
+        except Exception:
+            continue
+         
+    fallback_sector = infer_sector_from_name(company_name)
+    sector_cache[clean_ticker] = fallback_sector
+    return fallback_sector
 
 def assign_market_cap_tier(market_cap_val):
     if not market_cap_val or market_cap_val <= 0:
@@ -128,6 +184,7 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    # Ensure table columns exist
     for stmt in [
         "ALTER TABLE insider_trades ALTER COLUMN market_cap TYPE NUMERIC;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap NUMERIC;",
@@ -143,7 +200,8 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
             shares_bought, shares_owned_following, est_value, activity_type,
             market_cap, market_cap_category, benchmark_ticker
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT DO NOTHING;
     """
     
     inserted_count = 0
@@ -177,8 +235,10 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
                 skipped_count += 1
                 continue
             
+            company_name = entry.get('company', '')
             insider = root.findtext(".//rptOwnerName") or "UNKNOWN"
             title = root.findtext(".//officerTitle") or "Director/Other"
+            sector = get_sector_for_ticker(ticker, company_name)
             
             for tx in root.findall(".//nonDerivativeTransaction"):
                 code = tx.findtext(".//transactionCoding/transactionCode")
@@ -204,7 +264,7 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
                     
                     try:
                         cursor.execute(insert_query, (
-                            tx_date, ticker, "General Equity", insider, title, shares, owned, est_val, "BUY",
+                            tx_date, ticker, sector, insider, title, shares, owned, est_val, "BUY",
                             float(mcap) if mcap else None, category, benchmark
                         ))
                         conn.commit()
@@ -217,7 +277,7 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
 
     cursor.close()
     conn.close()
-    print(f"--- Finished backfill. Inserted {inserted_count} valid equity records (Skipped {skipped_count} non-equity/missing tickers). ---")
+    print(f"--- Finished backfill. Inserted {inserted_count} records (Skipped {skipped_count} non-equity/missing tickers). ---")
 
 if __name__ == "__main__":
     import sys
