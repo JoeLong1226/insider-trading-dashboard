@@ -3,6 +3,7 @@ import pandas as pd
 import psycopg2
 import streamlit as st
 import yfinance as yf
+from datetime import datetime
 
 st.set_page_config(
     page_title="Insider Trading Dashboard",
@@ -23,7 +24,6 @@ def get_stock_sector(ticker):
     if not ticker or ticker.upper() in ["UNKNOWN", "NONE", "NULL", "N/A"]:
         return "Unclassified"
     
-    # Manual fallback overrides for any tickers Yahoo Finance misses
     sector_fallbacks = {
         "PBPB": "Consumer Cyclical",
         "TTSH": "Healthcare",
@@ -43,14 +43,14 @@ def get_stock_sector(ticker):
     return "Unclassified"
 
 
-@st.cache_data(ttl=86400)  # Cache stock performance for 24 hours to prevent lag
-def calculate_trade_performance(ticker, tx_date_str, shares, est_value_db):
+@st.cache_data(ttl=86400)  # Cache benchmark & stock performance
+def calculate_trade_performance(ticker, benchmark_ticker, tx_date_str, shares, est_value_db):
     if (
         not ticker
         or ticker.upper() in ["UNKNOWN", "NONE", "NULL", "N/A"]
         or shares <= 0
     ):
-        return 0.0, 0.0, 0.0, est_value_db
+        return 0.0, 0.0, 0.0, est_value_db, 0.0
     
     clean_date_str = str(tx_date_str)[:10]
     cleaned_ticker = ticker.replace(".", "-")
@@ -58,18 +58,16 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value_db):
     try:
         stock = yf.Ticker(cleaned_ticker)
         tx_date = pd.to_datetime(clean_date_str)
-        current_price = stock.fast_info.get(
-            "lastPrice"
-        ) or stock.info.get("currentPrice")
+        current_price = stock.fast_info.get("lastPrice") or stock.info.get("currentPrice")
         hist = stock.history(start=clean_date_str)
         if hist.empty:
-            return 0.0, 0.0, 0.0, est_value_db
+            return 0.0, 0.0, 0.0, est_value_db, 0.0
         if not current_price:
             current_price = hist["Close"].iloc[-1]
 
         tx_price_adj = hist["Close"].iloc[0]
         if tx_price_adj <= 0:
-            return 0.0, 0.0, 0.0, est_value_db
+            return 0.0, 0.0, 0.0, est_value_db, 0.0
 
         true_est_value = shares * tx_price_adj
         stock_pct_return = (current_price - tx_price_adj) / tx_price_adj
@@ -100,14 +98,30 @@ def calculate_trade_performance(ticker, tx_date_str, shares, est_value_db):
             if true_est_value > 0
             else 0.0
         )
+
+        # Calculate Benchmark Return SINCE transaction date
+        benchmark_pct_return = 0.0
+        if benchmark_ticker and benchmark_ticker not in ["None", "UNKNOWN", ""]:
+            try:
+                b_stock = yf.Ticker(benchmark_ticker)
+                b_hist = b_stock.history(start=clean_date_str)
+                if not b_hist.empty and len(b_hist) >= 1:
+                    b_start_price = b_hist["Close"].iloc[0]
+                    b_current_price = b_stock.fast_info.get("lastPrice") or b_hist["Close"].iloc[-1]
+                    if b_start_price > 0:
+                        benchmark_pct_return = ((b_current_price - b_start_price) / b_start_price) * 100.0
+            except Exception:
+                pass
+
         return (
             total_dollar_return,
             percent_return,
             price_30d_change_pct,
             true_est_value,
+            benchmark_pct_return,
         )
     except Exception:
-        return 0.0, 0.0, 0.0, est_value_db
+        return 0.0, 0.0, 0.0, est_value_db, 0.0
 
 
 def process_advanced_conviction_metrics(df):
@@ -156,7 +170,6 @@ def process_advanced_conviction_metrics(df):
         ]
 
         unique_insiders = window_df["insider_name"].nunique()
-        
         insider_window = window_df[window_df["insider_name"] == insider]
         distinct_buy_days = insider_window["parsed_date"].nunique()
 
@@ -209,7 +222,6 @@ conn = None
 try:
     conn = get_db_connection()
 
-    # Sidebar Controls FIRST
     st.sidebar.header("Filter Dashboard")
     selected_year = st.sidebar.selectbox(
         "Filter by Year", ["All Years", "2026", "2025", "2024", "Older"]
@@ -218,22 +230,24 @@ try:
         "Max Rows to Load & Analyze", 50, 1000, 200, step=50
     )
 
-    # Toggle to filter out institutional/fund entity names cleanly
     hide_institutions = st.sidebar.checkbox(
         "Hide Institutional / Fund Entities", value=False
     )
 
-    # Dynamic SQL query based on year selection
     if selected_year == "All Years":
         query = f"""
-            SELECT transaction_date, ticker, sector, insider_name, insider_title, shares_bought, shares_owned_following, est_value, activity_type 
+            SELECT transaction_date, ticker, sector, insider_name, insider_title, 
+                   shares_bought, shares_owned_following, est_value, activity_type,
+                   market_cap, market_cap_category, benchmark_ticker
             FROM insider_trades 
             ORDER BY transaction_date DESC
             LIMIT {max_rows};
         """
     elif selected_year == "Older":
         query = f"""
-            SELECT transaction_date, ticker, sector, insider_name, insider_title, shares_bought, shares_owned_following, est_value, activity_type 
+            SELECT transaction_date, ticker, sector, insider_name, insider_title, 
+                   shares_bought, shares_owned_following, est_value, activity_type,
+                   market_cap, market_cap_category, benchmark_ticker
             FROM insider_trades 
             WHERE LEFT(transaction_date, 4) < '2024'
             ORDER BY transaction_date DESC
@@ -241,7 +255,9 @@ try:
         """
     else:
         query = f"""
-            SELECT transaction_date, ticker, sector, insider_name, insider_title, shares_bought, shares_owned_following, est_value, activity_type 
+            SELECT transaction_date, ticker, sector, insider_name, insider_title, 
+                   shares_bought, shares_owned_following, est_value, activity_type,
+                   market_cap, market_cap_category, benchmark_ticker
             FROM insider_trades 
             WHERE LEFT(transaction_date, 4) = '{selected_year}'
             ORDER BY transaction_date DESC
@@ -265,6 +281,7 @@ try:
         perf = [
             calculate_trade_performance(
                 row["ticker"],
+                row.get("benchmark_ticker"),
                 row["transaction_date"],
                 float(row["shares_bought"] or 0),
                 float(row["est_value"] or 0),
@@ -275,6 +292,7 @@ try:
         df["Return (%)"] = [p[1] for p in perf]
         df["price_30d_change_pct"] = [p[2] for p in perf]
         df["est_value"] = [p[3] for p in perf]
+        df["Benchmark Return (%)"] = [p[4] for p in perf]
 
         df = process_advanced_conviction_metrics(df)
 
@@ -282,6 +300,9 @@ try:
             lambda x: f"+${x:,.0f}" if x >= 0 else f"-${abs(x):,.0f}"
         )
         df["Total Return"] = df["Return (%)"].apply(
+            lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
+        )
+        df["Benchmark Return"] = df["Benchmark Return (%)"].apply(
             lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
         )
         df["Shares Bought"] = df["shares_bought"].apply(
@@ -312,7 +333,6 @@ try:
         * **🌐** **Sector Rotation** (High volume burst in sector)
         """)
 
-        # Sidebar CSV Download Button for testing & data exports
         st.sidebar.markdown("---")
         st.sidebar.markdown("### 💾 Export Data")
         csv_export = df.to_csv(index=False).encode('utf-8')
@@ -360,6 +380,9 @@ try:
                 "High Conviction Flag",
                 "ticker",
                 "sector",
+                "market_cap_category",
+                "benchmark_ticker",
+                "Benchmark Return",
                 "insider_name",
                 "insider_title",
                 "Shares Bought",
@@ -374,6 +397,9 @@ try:
                 "Signals",
                 "Ticker",
                 "Sector",
+                "Market Cap Tier",
+                "Benchmark",
+                "Benchmark Return",
                 "Insider Name",
                 "Title",
                 "Shares Bought",
