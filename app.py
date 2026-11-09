@@ -11,9 +11,10 @@ st.set_page_config(
 )
 
 
-@st.cache_resource
 def get_db_connection():
     conn_url = os.environ.get("SUPABASE_DB_URL")
+    if not conn_url:
+        raise ValueError("Missing SUPABASE_DB_URL environment variable.")
     return psycopg2.connect(conn_url)
 
 
@@ -156,7 +157,6 @@ def process_advanced_conviction_metrics(df):
 
         unique_insiders = window_df["insider_name"].nunique()
         
-        # Count distinct buy dates instead of raw rows to accurately measure true repeat buying
         insider_window = window_df[window_df["insider_name"] == insider]
         distinct_buy_days = insider_window["parsed_date"].nunique()
 
@@ -205,6 +205,7 @@ st.write(
     "Market-wide tracking of high-conviction open-market executive purchases ($50,000+)."
 )
 
+conn = None
 try:
     conn = get_db_connection()
 
@@ -250,13 +251,11 @@ try:
     df = pd.read_sql(query, conn)
 
     if not df.empty:
-        # Dynamically resolve 'Unclassified' sectors on the fly using yfinance & manual overrides
         df["sector"] = df.apply(
             lambda row: get_stock_sector(row["ticker"]) if row["sector"] in ["Unclassified", None, ""] else row["sector"],
             axis=1
         )
 
-        # Filter out funds/partnerships by name patterns if checked, preserving unclassified corporate executives
         if hide_institutions:
             fund_keywords = ["LLC", "L.P.", "PARTNERS", "FUNDS", "CAPITAL", "INVESTMENT", "MANAGEMENT"]
             pattern = '|'.join(fund_keywords)
@@ -312,6 +311,17 @@ try:
         * **🚀** **Skin-in-the-Game** (10%+ position increase, $50k+)
         * **🌐** **Sector Rotation** (High volume burst in sector)
         """)
+
+        # Sidebar CSV Download Button for testing & data exports
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("### 💾 Export Data")
+        csv_export = df.to_csv(index=False).encode('utf-8')
+        st.sidebar.download_button(
+            label="📥 Download Current Data (CSV)",
+            data=csv_export,
+            file_name="insider_trades_filtered.csv",
+            mime="text/csv",
+        )
 
         tab1, tab2 = st.tabs([
             "📊 Live Transactions Feed",
@@ -471,11 +481,16 @@ try:
                     )
             else:
                 st.info(
-                    "No equity insider trades available for leaderboard"
-                    " calculation."
+                    "No equity insider trades available for leaderboard calculation."
                 )
     else:
         st.info("No insider transactions found for the selected filter.")
 
 except Exception as e:
     st.error(f"Error connecting to database or fetching data: {e}")
+finally:
+    if conn:
+        try:
+            conn.close()
+        except Exception:
+            pass
