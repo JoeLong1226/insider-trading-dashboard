@@ -8,7 +8,8 @@ import xml.etree.ElementTree as ET
 import yfinance as yf
 import pandas as pd
 
-HEADERS = {'User-Agent': 'InsiderTradingApp admin@example.com'}
+# FIX: Use a compliant User-Agent with a real contact email format
+HEADERS = {'User-Agent': 'InsiderTradingBackfillApp developer@yourdomain.com'}
 SUPABASE_URL = os.environ.get("SUPABASE_DB_URL")
 
 def get_db_connection():
@@ -161,16 +162,16 @@ def fetch_quarterly_index(year, quarter):
             continue
         if data_started and line.strip():
             parts = line.split('|')
-            if len(parts) == 5 and parts[2] == '4':
+            if len(parts) == 5 and parts[2].strip() == '4':
                 form4_entries.append({
-                    'cik': parts[0],
-                    'company': parts[1],
-                    'date_filed': parts[3],
+                    'cik': parts[0].strip(),
+                    'company': parts[1].strip(),
+                    'date_filed': parts[3].strip(),
                     'filename': parts[4].strip()
                 })
     return form4_entries
 
-def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
+def parse_and_index_range(start_date_str, end_date_str, min_value=50000):
     start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
     
@@ -184,16 +185,6 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Ensure table columns exist
-    for stmt in [
-        "ALTER TABLE insider_trades ALTER COLUMN market_cap TYPE NUMERIC;",
-        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap NUMERIC;",
-        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap_category TEXT;",
-        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS benchmark_ticker TEXT;"
-    ]:
-        try: cursor.execute(stmt); conn.commit()
-        except Exception: conn.rollback()
-    
     insert_query = """
         INSERT INTO insider_trades (
             transaction_date, ticker, sector, insider_name, insider_title, 
@@ -209,19 +200,19 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
 
     for entry in filtered_entries:
         txt_url = f"https://www.sec.gov/Archives/{entry['filename']}"
-        time.sleep(0.12)
+        time.sleep(0.12) # Rate limit pacing
         
         try:
             res = requests.get(txt_url, headers=HEADERS, timeout=10)
-            if res.status_code != 200 or "<xml>" not in res.text.lower():
+            if res.status_code != 200:
                 continue
                 
-            xml_start = res.text.find("<XML>")
-            xml_end = res.text.find("</XML>")
-            if xml_start == -1 or xml_end == -1:
+            # FIX: Use regex with re.IGNORECASE to capture both <XML> and <xml>
+            xml_match = re.search(r'<xml>(.*?)</xml>', res.text, re.DOTALL | re.IGNORECASE)
+            if not xml_match:
                 continue
                 
-            xml_content = res.text[xml_start+5:xml_end].strip()
+            xml_content = xml_match.group(1).strip()
             root = ET.fromstring(xml_content)
             
             ticker = "NONE"
@@ -277,11 +268,11 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
 
     cursor.close()
     conn.close()
-    print(f"--- Finished backfill. Inserted {inserted_count} records (Skipped {skipped_count} non-equity/missing tickers). ---")
+    print(f"--- Finished backfill. Inserted {inserted_count} records (Skipped {skipped_count}). ---")
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) >= 3:
-        parse_and_insert_range(sys.argv[1], sys.argv[2])
+        parse_and_index_range(sys.argv[1], sys.argv[2])
     else:
-        parse_and_insert_range("2026-05-01", "2026-05-31")
+        parse_and_index_range("2022-01-01", "2022-01-31")
