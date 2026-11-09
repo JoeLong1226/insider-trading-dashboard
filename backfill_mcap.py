@@ -18,6 +18,7 @@ def get_db_connection():
     return psycopg2.connect(SUPABASE_URL)
 
 
+# --- SECTOR LOGIC ---
 sector_cache = {
     "AON": "Financial Services",
     "AAPL": "Technology",
@@ -49,15 +50,9 @@ def get_sector_for_ticker(ticker, company_name=""):
         return infer_sector_from_name(company_name)
      
     clean_ticker = ticker.strip().upper()
-     
-    # Clean up exchange prefixes like "NYSE: VTEX" -> "VTEX"
     if ":" in clean_ticker:
         clean_ticker = clean_ticker.split(":")[-1].strip()
-         
-    # Strip brackets, unwanted spaces, or weird formatting
     clean_ticker = re.sub(r'[\[\]\s]', '', clean_ticker)
-     
-    # Handle dual-class / multi-ticker formatting like "HEI, HEI.A" -> "HEI"
     if "," in clean_ticker:
         clean_ticker = clean_ticker.split(",")[0].strip()
     elif "/" in clean_ticker:
@@ -69,28 +64,12 @@ def get_sector_for_ticker(ticker, company_name=""):
     if clean_ticker in sector_cache:
         return sector_cache[clean_ticker]
      
-    candidates = [clean_ticker]
-    if re.search(r'\d+\$', clean_ticker):
-        candidates.append(f"{clean_ticker}.SA")
-    else:
-        candidates.append(f"{clean_ticker}.PK")
-         
-    for sym in candidates:
-        try:
-            tk = yf.Ticker(sym)
-            info = tk.info
-            sector = info.get("sector") or info.get("industry")
-            if sector:
-                sector_cache[clean_ticker] = sector
-                return sector
-        except Exception:
-            continue
-         
     fallback_sector = infer_sector_from_name(company_name)
     sector_cache[clean_ticker] = fallback_sector
     return fallback_sector
 
 
+# --- MARKET CAP & CACHING LOGIC ---
 TICKER_ALIASES = {
     "LBTY": "LBTYA",
     "GOOG": "GOOGL",
@@ -118,8 +97,15 @@ def assign_market_cap_tier(market_cap_val):
         return 'Large', 'SPY'
 
 
+# In-memory run cache so we NEVER query Yahoo Finance twice for the same ticker in a single run
+mcap_cache = {}
+
 def get_point_in_time_metadata(ticker_symbol, tx_date_str):
     cleaned_ticker = clean_ticker_for_yf(ticker_symbol)
+    cache_key = f"{cleaned_ticker}_{tx_date_str[:7]}" # Cache by ticker and month
+    if cache_key in mcap_cache:
+        return mcap_cache[cache_key]
+
     try:
         tx_date = datetime.strptime(tx_date_str.strip(), '%Y-%m-%d').date()
         start_date = tx_date - timedelta(days=5)
@@ -129,6 +115,7 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
         hist = t.history(start=str(start_date), end=str(end_date))
         
         if hist.empty or 'Close' not in hist.columns:
+            mcap_cache[cache_key] = (None, 'Unknown', None)
             return None, 'Unknown', None
             
         hist.index = hist.index.date
@@ -152,15 +139,23 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
             pass
 
         if not shares or shares <= 0:
-            shares = float(t.fast_info.shares) if t.fast_info.shares else None
+            try:
+                shares = float(t.fast_info.shares) if t.fast_info.shares else None
+            except Exception:
+                pass
 
         if not shares or shares <= 0:
+            mcap_cache[cache_key] = (None, 'Unknown', None)
             return None, 'Unknown', None
 
         historical_mcap = price * shares
         category, benchmark = assign_market_cap_tier(historical_mcap)
-        return historical_mcap, category, benchmark
+        
+        result = (historical_mcap, category, benchmark)
+        mcap_cache[cache_key] = result
+        return result
     except Exception:
+        mcap_cache[cache_key] = (None, 'Unknown', None)
         return None, 'Unknown', None
 
 
@@ -173,7 +168,6 @@ def fetch_quarterly_index(year, quarter):
 
     lines = response.text.split('\n')
     form4_entries = []
-     
     data_started = False
     for line in lines:
         if "CIK|Company Name|Form Type|Date Filed|Filename" in line:
@@ -199,17 +193,13 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
     print(f"--- Fetching QTR {qtr} index for {start_dt.year} ({start_date_str} to {end_date_str}) ---")
      
     all_entries = fetch_quarterly_index(start_dt.year, qtr)
-     
-    filtered_entries = [
-        e for e in all_entries 
-        if start_date_str <= e['date_filed'] <= end_date_str
-    ]
+    filtered_entries = [e for e in all_entries if start_date_str <= e['date_filed'] <= end_date_str]
     print(f"Found {len(filtered_entries)} Form 4 filings for target period. Starting ingestion...")
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Ensure market cap columns exist in Supabase
+    # Ensure all columns exist in Supabase
     for stmt in [
         "ALTER TABLE insider_trades ALTER COLUMN market_cap TYPE NUMERIC;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap NUMERIC;",
@@ -233,10 +223,10 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
     skipped_count = 0
     for entry in filtered_entries:
         txt_url = f"https://www.sec.gov/Archives/{entry['filename']}"
-        time.sleep(0.12)
+        time.sleep(0.05) # Faster polling
          
         try:
-            res = requests.get(txt_url, headers=HEADERS, timeout=10)
+            res = requests.get(txt_url, headers=HEADERS, timeout=8)
             if res.status_code != 200 or "<xml>" not in res.text.lower():
                 continue
                  
@@ -287,7 +277,7 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
                     owned_str = tx.findtext(".//sharesOwnedFollowingTransaction/value")
                     owned = float(owned_str) if owned_str else 0.0
                     
-                    # Compute point-in-time market cap
+                    # Compute point-in-time market cap (cached for speed)
                     mcap, category, benchmark = get_point_in_time_metadata(ticker, tx_date)
                      
                     try:
@@ -314,5 +304,4 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3:
         parse_and_insert_range(sys.argv[1], sys.argv[2])
     else:
-        # Default test range
-        parse_and_insert_range("2026-05-01", "2026-05-31")
+        parse_and_insert_range("2026-05-01", "2026-05-03")
