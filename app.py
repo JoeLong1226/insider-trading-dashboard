@@ -50,7 +50,7 @@ def calculate_trade_performance(ticker, benchmark_ticker, tx_date_str, shares, e
         or ticker.upper() in ["UNKNOWN", "NONE", "NULL", "N/A"]
         or shares <= 0
     ):
-        return 0.0, 0.0, 0.0, est_value_db, 0.0
+        return 0.0, 0.0, 0.0, est_value_db, 0.0, 0.0
     
     clean_date_str = str(tx_date_str)[:10]
     cleaned_ticker = ticker.replace(".", "-")
@@ -61,13 +61,13 @@ def calculate_trade_performance(ticker, benchmark_ticker, tx_date_str, shares, e
         current_price = stock.fast_info.get("lastPrice") or stock.info.get("currentPrice")
         hist = stock.history(start=clean_date_str)
         if hist.empty:
-            return 0.0, 0.0, 0.0, est_value_db, 0.0
+            return 0.0, 0.0, 0.0, est_value_db, 0.0, 0.0
         if not current_price:
             current_price = hist["Close"].iloc[-1]
 
         tx_price_adj = hist["Close"].iloc[0]
         if tx_price_adj <= 0:
-            return 0.0, 0.0, 0.0, est_value_db, 0.0
+            return 0.0, 0.0, 0.0, est_value_db, 0.0, 0.0
 
         true_est_value = shares * tx_price_adj
         stock_pct_return = (current_price - tx_price_adj) / tx_price_adj
@@ -113,15 +113,19 @@ def calculate_trade_performance(ticker, benchmark_ticker, tx_date_str, shares, e
             except Exception:
                 pass
 
+        # Calculate Alpha (Stock Return vs Benchmark Return)
+        alpha_return = percent_return - benchmark_pct_return
+
         return (
             total_dollar_return,
             percent_return,
             price_30d_change_pct,
             true_est_value,
             benchmark_pct_return,
+            alpha_return,
         )
     except Exception:
-        return 0.0, 0.0, 0.0, est_value_db, 0.0
+        return 0.0, 0.0, 0.0, est_value_db, 0.0, 0.0
 
 
 def process_advanced_conviction_metrics(df):
@@ -293,6 +297,7 @@ try:
         df["price_30d_change_pct"] = [p[2] for p in perf]
         df["est_value"] = [p[3] for p in perf]
         df["Benchmark Return (%)"] = [p[4] for p in perf]
+        df["Alpha Return (%)"] = [p[5] for p in perf]
 
         df = process_advanced_conviction_metrics(df)
 
@@ -304,6 +309,12 @@ try:
         )
         df["Benchmark Return"] = df["Benchmark Return (%)"].apply(
             lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
+        )
+        df["Alpha Return"] = df["Alpha Return (%)"].apply(
+            lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
+        )
+        df["Market Cap at Tx"] = df["market_cap"].apply(
+            lambda x: f"${x:,.0f}" if pd.notnull(x) and x > 0 else "N/A"
         )
         df["Shares Bought"] = df["shares_bought"].apply(
             lambda x: f"+{x:,.0f}" if pd.notnull(x) else "+0"
@@ -374,21 +385,24 @@ try:
 
             st.subheader("📋 Insider Transactions Database")
 
+            # Structured with core info on left, and Market Cap / Benchmark metrics cleanly on the right
             display_df = display_source[[
                 "transaction_date",
                 "Conviction Score",
                 "High Conviction Flag",
                 "ticker",
                 "sector",
-                "market_cap_category",
-                "benchmark_ticker",
-                "Benchmark Return",
                 "insider_name",
                 "insider_title",
                 "Shares Bought",
                 "Est. Value ($)",
                 "Unrealized Gain",
                 "Total Return",
+                "Market Cap at Tx",
+                "market_cap_category",
+                "benchmark_ticker",
+                "Benchmark Return",
+                "Alpha Return",
             ]]
 
             display_df.columns = [
@@ -397,15 +411,17 @@ try:
                 "Signals",
                 "Ticker",
                 "Sector",
-                "Market Cap Tier",
-                "Benchmark",
-                "Benchmark Return",
                 "Insider Name",
                 "Title",
                 "Shares Bought",
                 "Est. Value ($)",
                 "Unrealized Gain (Inc. Divs)",
                 "Total Return",
+                "Market Cap at Tx",
+                "Market Cap Tier",
+                "Benchmark",
+                "Benchmark Return",
+                "Alpha vs Benchmark",
             ]
 
             st.dataframe(display_df, use_container_width=True)
