@@ -264,45 +264,33 @@ try:
         "Hide Institutional / Fund Entities", value=False
     )
 
-    if selected_year == "All Years":
-        query = f"""
-            SELECT transaction_date, ticker, sector, insider_name, insider_title, 
-                   shares_bought, shares_owned_following, est_value, activity_type,
-                   market_cap, market_cap_category, benchmark_ticker
-            FROM insider_trades 
-            ORDER BY transaction_date DESC
-            LIMIT {max_rows};
-        """
-    elif selected_year == "Older":
-        query = f"""
-            SELECT transaction_date, ticker, sector, insider_name, insider_title, 
-                   shares_bought, shares_owned_following, est_value, activity_type,
-                   market_cap, market_cap_category, benchmark_ticker
-            FROM insider_trades 
-            WHERE LEFT(transaction_date, 4) < '2024'
-            ORDER BY transaction_date DESC
-            LIMIT {max_rows};
-        """
-    else:
-        query = f"""
-            SELECT transaction_date, ticker, sector, insider_name, insider_title, 
-                   shares_bought, shares_owned_following, est_value, activity_type,
-                   market_cap, market_cap_category, benchmark_ticker
-            FROM insider_trades 
-            WHERE LEFT(transaction_date, 4) = '{selected_year}'
-            ORDER BY transaction_date DESC
-            LIMIT {max_rows};
-        """
+    # Build dynamic WHERE clauses for both Year and Month directly into SQL
+    where_clauses = []
+    if selected_year == "Older":
+        where_clauses.append("LEFT(transaction_date, 4) < '2024'")
+    elif selected_year != "All Years":
+        where_clauses.append(f"LEFT(transaction_date, 4) = '{selected_year}'")
+
+    if selected_month != "All Months":
+        month_idx = months.index(selected_month)
+        month_str = f"{month_idx:02d}"
+        where_clauses.append(f"SUBSTRING(transaction_date, 6, 2) = '{month_str}'")
+
+    where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+    query = f"""
+        SELECT transaction_date, ticker, sector, insider_name, insider_title, 
+               shares_bought, shares_owned_following, est_value, activity_type,
+               market_cap, market_cap_category, benchmark_ticker
+        FROM insider_trades 
+        {where_sql}
+        ORDER BY transaction_date DESC
+        LIMIT {max_rows};
+    """
 
     df = pd.read_sql(query, conn)
 
     if not df.empty:
-        df["filing_date"] = pd.to_datetime(df["transaction_date"])
-
-        if selected_month != "All Months":
-            month_num = months.index(selected_month)
-            df = df[df["filing_date"].dt.month == month_num]
-
         df["sector"] = df.apply(
             lambda row: get_stock_sector(row["ticker"])
             if row["sector"] in ["Unclassified", None, ""]
