@@ -103,7 +103,6 @@ def calculate_trade_performance(
             else 0.0
         )
 
-        # Calculate Benchmark Return SINCE transaction date
         benchmark_pct_return = 0.0
         if benchmark_ticker and benchmark_ticker not in ["None", "UNKNOWN", ""]:
             try:
@@ -121,7 +120,6 @@ def calculate_trade_performance(
             except Exception:
                 pass
 
-        # Calculate Alpha (Stock Return vs Benchmark Return)
         alpha_return = percent_return - benchmark_pct_return
 
         return (
@@ -227,7 +225,7 @@ def process_advanced_conviction_metrics(df):
 
 st.title("📊 Insider Transactions Dashboard")
 st.write(
-    "Market-wide tracking of high-conviction open-market executive purchases ($50,000+)."
+    "Market-wide tracking of high-conviction open-market executive purchases (\$50,000+)."
 )
 
 conn = None
@@ -264,7 +262,6 @@ try:
         "Hide Institutional / Fund Entities", value=False
     )
 
-    # Build dynamic WHERE clauses for both Year and Month directly into SQL
     where_clauses = []
     if selected_year == "Older":
         where_clauses.append("LEFT(transaction_date, 4) < '2024'")
@@ -291,6 +288,21 @@ try:
     df = pd.read_sql(query, conn)
 
     if not df.empty:
+        # 1. GROUP SAME-DAY MULTI-LOT TRADES BY SAME INSIDER
+        group_cols = ["transaction_date", "ticker", "insider_name"]
+        agg_rules = {
+            "sector": "first",
+            "insider_title": "first",
+            "shares_bought": "sum",
+            "shares_owned_following": "last",
+            "est_value": "sum",
+            "activity_type": "first",
+            "market_cap": "first",
+            "market_cap_category": "first",
+            "benchmark_ticker": "first",
+        }
+        df = df.groupby(group_cols, as_index=False).agg(agg_rules)
+
         df["sector"] = df.apply(
             lambda row: get_stock_sector(row["ticker"])
             if row["sector"] in ["Unclassified", None, ""]
@@ -324,7 +336,7 @@ try:
             )
             for _, row in df.iterrows()
         ]
-        df["Unrealized Profit ($)"] = [p[0] for p in perf]
+        df["Unrealized Profit (\$)"] = [p[0] for p in perf]
         df["Return (%)"] = [p[1] for p in perf]
         df["price_30d_change_pct"] = [p[2] for p in perf]
         df["est_value"] = [p[3] for p in perf]
@@ -333,26 +345,51 @@ try:
 
         df = process_advanced_conviction_metrics(df)
 
-        df["Unrealized Gain"] = df["Unrealized Profit ($)"].apply(
-            lambda x: f"+${x:,.0f}" if x >= 0 else f"-${abs(x):,.0f}"
+        # 2. FORMAT MARKET CAPS LIKE \$43.2B
+        def format_market_cap(x):
+            if pd.notnull(x) and x > 0:
+                if x >= 1e9:
+                    return f"\${x / 1e9:.1f}B"
+                elif x >= 1e6:
+                    return f"\${x / 1e6:.1f}M"
+                return f"\${x:,.0f}"
+            return "N/A"
+
+        df["Market Cap at Tx"] = df["market_cap"].apply(format_market_cap)
+        df["Shares Bought"] = df["shares_bought"].apply(
+            lambda x: f"+{x:,.0f}" if pd.notnull(x) else "+0"
         )
-        df["Total Return"] = df["Return (%)"].apply(
-            lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
+        df["Est. Value (\$)"] = df["est_value"].apply(
+            lambda x: f"\${x:,.0f}" if pd.notnull(x) else "\$0"
         )
+
+        # 3. DISPLAY 'N/A (New)' FOR FRESH FILINGS WITH \$0 RETURN
+        current_date = pd.to_datetime("2026-11-10")
+
+        def format_gain(row):
+            profit = row["Unrealized Profit (\$)"]
+            tx_date = pd.to_datetime(str(row["transaction_date"])[:10])
+            if (current_date - tx_date).days <= 2 and profit == 0:
+                return "N/A (New)"
+            return (
+                f"+\${profit:,.0f}" if profit >= 0 else f"-\${abs(profit):,.0f}"
+            )
+
+        def format_return(row):
+            ret = row["Return (%)"]
+            tx_date = pd.to_datetime(str(row["transaction_date"])[:10])
+            if (current_date - tx_date).days <= 2 and ret == 0:
+                return "N/A (New)"
+            return f"+{ret:.1f}%" if ret >= 0 else f"{ret:.1f}%"
+
+        df["Unrealized Gain"] = df.apply(format_gain, axis=1)
+        df["Total Return"] = df.apply(format_return, axis=1)
+
         df["Benchmark Return"] = df["Benchmark Return (%)"].apply(
             lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
         )
         df["Alpha Return"] = df["Alpha Return (%)"].apply(
             lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
-        )
-        df["Market Cap at Tx"] = df["market_cap"].apply(
-            lambda x: f"${x:,.0f}" if pd.notnull(x) and x > 0 else "N/A"
-        )
-        df["Shares Bought"] = df["shares_bought"].apply(
-            lambda x: f"+{x:,.0f}" if pd.notnull(x) else "+0"
-        )
-        df["Est. Value ($)"] = df["est_value"].apply(
-            lambda x: f"${x:,.0f}" if pd.notnull(x) else "$0"
         )
 
         show_flags_only = st.sidebar.checkbox(
@@ -372,7 +409,7 @@ try:
         * **🎯** **Bullish Divergence** (10%+ stock dip with C-suite buying)
         * **🔥** **Cluster** (2+ insiders in prior 60d)
         * **⚡** **C-Suite Accumulation** (Repeat buying by execs)
-        * **🚀** **Skin-in-the-Game** (10%+ position increase, $50k+)
+        * **🚀** **Skin-in-the-Game** (10%+ position increase, \$50k+)
         * **🌐** **Sector Rotation** (High volume burst in sector)
         """)
 
@@ -404,7 +441,7 @@ try:
             col4.metric("Unique Insiders", df["insider_name"].nunique())
             col5.metric(
                 "Total Dollar Volume",
-                f"${df['est_value'].astype(float).sum():,.0f}",
+                f"\${df['est_value'].astype(float).sum():,.0f}",
             )
 
             st.markdown("---")
@@ -426,7 +463,7 @@ try:
                 "insider_name",
                 "insider_title",
                 "Shares Bought",
-                "Est. Value ($)",
+                "Est. Value (\$)",
                 "Unrealized Gain",
                 "Total Return",
                 "Market Cap at Tx",
@@ -445,7 +482,7 @@ try:
                 "Insider Name",
                 "Title",
                 "Shares Bought",
-                "Est. Value ($)",
+                "Est. Value (\$)",
                 "Unrealized Gain (Inc. Divs)",
                 "Total Return",
                 "Market Cap at Tx",
@@ -467,23 +504,23 @@ try:
                     .agg({
                         "shares_bought": "sum",
                         "est_value": "sum",
-                        "Unrealized Profit ($)": "sum",
+                        "Unrealized Profit (\$)": "sum",
                     })
                     .reset_index()
                 )
 
                 leaderboard["roi_pct"] = (
-                    leaderboard["Unrealized Profit ($)"]
+                    leaderboard["Unrealized Profit (\$)"]
                     / leaderboard["est_value"]
                 ) * 100.0
 
                 leaderboard["Total Invested"] = leaderboard["est_value"].apply(
-                    lambda x: f"${x:,.0f}"
+                    lambda x: f"\${x:,.0f}"
                 )
-                leaderboard["Net Profit/Loss ($)"] = leaderboard[
-                    "Unrealized Profit ($)"
+                leaderboard["Net Profit/Loss (\$)"] = leaderboard[
+                    "Unrealized Profit (\$)"
                 ].apply(
-                    lambda x: f"+${x:,.0f}" if x >= 0 else f"-${abs(x):,.0f}"
+                    lambda x: f"+\${x:,.0f}" if x >= 0 else f"-\${abs(x):,.0f}"
                 )
                 leaderboard["Cumulative ROI (%)"] = leaderboard["roi_pct"].apply(
                     lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
@@ -492,31 +529,31 @@ try:
                 col_left, col_right = st.columns(2)
 
                 with col_left:
-                    st.markdown("### 🟢 Top Dollar Winners ($)")
+                    st.markdown("### 🟢 Top Dollar Winners (\$)")
                     top_dollar_winners = leaderboard.sort_values(
-                        by="Unrealized Profit ($)", ascending=False
+                        by="Unrealized Profit (\$)", ascending=False
                     ).head(10)
                     st.dataframe(
                         top_dollar_winners[[
                             "insider_name",
                             "ticker",
                             "Total Invested",
-                            "Net Profit/Loss ($)",
+                            "Net Profit/Loss (\$)",
                             "Cumulative ROI (%)",
                         ]],
                         use_container_width=True,
                     )
 
-                    st.markdown("### 🔴 Top Dollar Losers ($)")
+                    st.markdown("### 🔴 Top Dollar Losers (\$)")
                     top_dollar_losers = leaderboard.sort_values(
-                        by="Unrealized Profit ($)", ascending=True
+                        by="Unrealized Profit (\$)", ascending=True
                     ).head(10)
                     st.dataframe(
                         top_dollar_losers[[
                             "insider_name",
                             "ticker",
                             "Total Invested",
-                            "Net Profit/Loss ($)",
+                            "Net Profit/Loss (\$)",
                             "Cumulative ROI (%)",
                         ]],
                         use_container_width=True,
@@ -524,46 +561,3 @@ try:
 
                 with col_right:
                     st.markdown("### 🚀 Top ROI Winners (%)")
-                    top_pct_winners = leaderboard.sort_values(
-                        by="roi_pct", ascending=False
-                    ).head(10)
-                    st.dataframe(
-                        top_pct_winners[[
-                            "insider_name",
-                            "ticker",
-                            "Total Invested",
-                            "Net Profit/Loss ($)",
-                            "Cumulative ROI (%)",
-                        ]],
-                        use_container_width=True,
-                    )
-
-                    st.markdown("### 📉 Top ROI Losers (%)")
-                    top_pct_losers = leaderboard.sort_values(
-                        by="roi_pct", ascending=True
-                    ).head(10)
-                    st.dataframe(
-                        top_pct_losers[[
-                            "insider_name",
-                            "ticker",
-                            "Total Invested",
-                            "Net Profit/Loss ($)",
-                            "Cumulative ROI (%)",
-                        ]],
-                        use_container_width=True,
-                    )
-            else:
-                st.info(
-                    "No equity insider trades available for leaderboard calculation."
-                )
-    else:
-        st.info("No insider transactions found for the selected filter.")
-
-except Exception as e:
-    st.error(f"Error connecting to database or fetching data: {e}")
-finally:
-    if conn:
-        try:
-            conn.close()
-        except Exception:
-            pass
