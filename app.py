@@ -135,11 +135,11 @@ def calculate_trade_performance(
 
 
 def process_advanced_conviction_metrics(df):
-    """Institutional Conviction Score Architecture v2.0.
+    """Institutional Conviction Score Architecture v2.1.
 
-    Re-engineered to prioritize relative skin-in-the-game, multi-insider
-    consensus, operational role authority, and consolidated trade sizing.
-    Removes dip-buying adverse selection traps.
+    Re-engineered to incorporate relative skin-in-the-game, multi-insider
+    consensus, operational role authority, consolidated trade sizing,
+    micro-cap noise suppression, and falling-knife trend filters.
     """
     df["parsed_date"] = pd.to_datetime(df["transaction_date"].astype(str).str[:10])
     df = df.sort_values(by="parsed_date", ascending=True).reset_index(drop=True)
@@ -150,22 +150,13 @@ def process_advanced_conviction_metrics(df):
     for idx, row in df.iterrows():
         current_date = row["parsed_date"]
         ticker = row["ticker"]
-        insider = row["insider_name"]
         title = str(row["insider_title"] or "").upper()
 
-        shares_bought = (
-            float(row["shares_bought"])
-            if pd.notnull(row["shares_bought"])
-            else 0.0
-        )
-        shares_following = (
-            float(row["shares_owned_following"])
-            if pd.notnull(row["shares_owned_following"])
-            else 0.0
-        )
-        est_val = (
-            float(row["est_value"]) if pd.notnull(row["est_value"]) else 0.0
-        )
+        shares_bought = float(row["shares_bought"]) if pd.notnull(row["shares_bought"]) else 0.0
+        shares_following = float(row["shares_owned_following"]) if pd.notnull(row["shares_owned_following"]) else 0.0
+        est_val = float(row["est_value"]) if pd.notnull(row["est_value"]) else 0.0
+        market_cap = float(row["market_cap"]) if pd.notnull(row["market_cap"]) else 0.0
+        price_30d = float(row.get("price_30d_change_pct", 0.0) or 0.0)
 
         # 1. Relative Personal Commitment (% Position Increase)
         prior_shares = shares_following - shares_bought
@@ -187,66 +178,60 @@ def process_advanced_conviction_metrics(df):
             window_df["insider_title"]
             .astype(str)
             .str.upper()
-            .str.contains(
-                "CEO|CFO|COO|CHIEF EXECUTIVE|CHIEF FINANCIAL|CHIEF OPERATING"
-            )
+            .str.contains("CEO|CFO|COO|CHIEF EXECUTIVE|CHIEF FINANCIAL|CHIEF OPERATING")
         ]["insider_name"].nunique()
 
         distinct_all_insiders = window_df["insider_name"].nunique()
 
         # 3. Role Tiering
         is_tier1 = any(
-            t in title
-            for t in [
-                "CEO",
-                "CFO",
-                "COO",
-                "CHIEF EXECUTIVE",
-                "CHIEF FINANCIAL",
-                "CHIEF OPERATING",
-            ]
+            t in title for t in ["CEO", "CFO", "COO", "CHIEF EXECUTIVE", "CHIEF FINANCIAL", "CHIEF OPERATING"]
         )
-        is_tier2 = (
-            any(t in title for t in ["PRESIDENT", "VP", "VICE PRESIDENT"])
-            and not is_tier1
-        )
+        is_tier2 = any(t in title for t in ["PRESIDENT", "VP", "VICE PRESIDENT"]) and not is_tier1
 
-        score = 0
+        score = 15  # Base score
 
-        # Factor A: Consolidated Trade Value (Max 15 pts)
-        if est_val >= 500000:
-            score += 15
-        elif est_val >= 100000:
+        # Factor A: Market Cap Adjustment (penalize extreme micro-cap distress noise < $50M)
+        if 0 < market_cap < 50000000:
+            score -= 10
+        elif market_cap >= 500000000:  # Mid/Large cap stability bonus
             score += 10
-        elif est_val >= 50000:
-            score += 5
 
-        # Factor B: Relative Personal Stake Expansion (Max 25 pts)
-        if est_val >= 50000:
-            if position_increase_pct >= 50.0:
-                score += 25
-            elif position_increase_pct >= 25.0:
-                score += 18
-            elif position_increase_pct >= 10.0:
-                score += 10
-
-        # Factor C: Multi-Insider Consensus (Max 30 pts)
-        if distinct_csuite_insiders >= 2:
-            score += 30
-        elif distinct_all_insiders >= 3:
-            score += 25
-        elif distinct_all_insiders == 2:
-            score += 15
-
-        # Factor D: Operational Role Authority (Max 20 pts)
+        # Factor B: Operational Role Authority
         if is_tier1:
-            score += 20
+            score += 25
         elif is_tier2:
-            score += 10
+            score += 15
         else:
             score += 5
 
-        score = min(max(score, 10), 100)
+        # Factor C: Relative Personal Stake Expansion
+        if position_increase_pct >= 100.0:
+            score += 30
+        elif position_increase_pct >= 50.0:
+            score += 20
+        elif position_increase_pct >= 10.0:
+            score += 10
+
+        # Factor D: Absolute Dollar Commitment
+        if est_val >= 500000:
+            score += 20
+        elif est_val >= 100000:
+            score += 10
+
+        # Factor E: Multi-Insider Consensus Bonus
+        if distinct_csuite_insiders >= 2:
+            score += 25
+        elif distinct_all_insiders >= 3:
+            score += 20
+
+        # Factor F: Trend Filter (Avoid Falling Knives)
+        if price_30d < -30.0:  # Stock crashed >30% before purchase (value trap risk)
+            score -= 20
+        elif -15.0 <= price_30d <= 15.0:  # Stable accumulation / consolidation zone
+            score += 15
+
+        score = min(max(score, 0), 100)
         scores.append(score)
 
         # Signal Flags
