@@ -6,7 +6,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="Insider Trading Dashboard",
+    page_title="Insider Transactions Dashboard",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -135,12 +135,14 @@ def calculate_trade_performance(
 
 
 def process_advanced_conviction_metrics(df):
-    """Calculates Point-in-Time Conviction Score strictly looking backward."""
+    """Institutional Conviction Score Architecture v2.0.
+
+    Re-engineered to prioritize relative skin-in-the-game, multi-insider
+    consensus, operational role authority, and consolidated trade sizing.
+    Removes dip-buying adverse selection traps.
+    """
     df["parsed_date"] = pd.to_datetime(df["transaction_date"].astype(str).str[:10])
     df = df.sort_values(by="parsed_date", ascending=True).reset_index(drop=True)
-
-    sector_volumes = df.groupby("sector")["est_value"].transform("sum")
-    avg_sector_vol = df["est_value"].sum() / max(df["sector"].nunique(), 1)
 
     flags = []
     scores = []
@@ -149,7 +151,6 @@ def process_advanced_conviction_metrics(df):
         current_date = row["parsed_date"]
         ticker = row["ticker"]
         insider = row["insider_name"]
-        sector = row["sector"]
         title = str(row["insider_title"] or "").upper()
 
         shares_bought = (
@@ -165,54 +166,97 @@ def process_advanced_conviction_metrics(df):
         est_val = (
             float(row["est_value"]) if pd.notnull(row["est_value"]) else 0.0
         )
-        price_30d_change = row.get("price_30d_change_pct", 0.0)
 
+        # 1. Relative Personal Commitment (% Position Increase)
         prior_shares = shares_following - shares_bought
         if prior_shares > 0 and shares_bought > 0:
             position_increase_pct = (shares_bought / prior_shares) * 100.0
+        elif shares_bought > 0 and prior_shares <= 0:
+            position_increase_pct = 100.0  # New position initiation
         else:
             position_increase_pct = 0.0
 
+        # 2. Multi-Insider Consensus (Rolling 30-day Window)
         window_df = df[
             (df["ticker"] == ticker)
-            & (df["parsed_date"] >= current_date - pd.Timedelta(days=60))
+            & (df["parsed_date"] >= current_date - pd.Timedelta(days=30))
             & (df["parsed_date"] <= current_date)
         ]
 
-        unique_insiders = window_df["insider_name"].nunique()
-        insider_window = window_df[window_df["insider_name"] == insider]
-        distinct_buy_days = insider_window["parsed_date"].nunique()
+        distinct_csuite_insiders = window_df[
+            window_df["insider_title"]
+            .astype(str)
+            .str.upper()
+            .str.contains(
+                "CEO|CFO|COO|CHIEF EXECUTIVE|CHIEF FINANCIAL|CHIEF OPERATING"
+            )
+        ]["insider_name"].nunique()
 
-        is_csuite = any(
+        distinct_all_insiders = window_df["insider_name"].nunique()
+
+        # 3. Role Tiering
+        is_tier1 = any(
             t in title
-            for t in ["CEO", "CHIEF EXECUTIVE", "CFO", "CHAIRMAN", "PRESIDENT"]
+            for t in [
+                "CEO",
+                "CFO",
+                "COO",
+                "CHIEF EXECUTIVE",
+                "CHIEF FINANCIAL",
+                "CHIEF OPERATING",
+            ]
+        )
+        is_tier2 = (
+            any(t in title for t in ["PRESIDENT", "VP", "VICE PRESIDENT"])
+            and not is_tier1
         )
 
         score = 0
-        score += min(int((est_val / 500000) * 30), 30)
-        if is_csuite:
-            score += 25
-        if unique_insiders >= 2:
-            score += 25
-        elif distinct_buy_days >= 2:
+
+        # Factor A: Consolidated Trade Value (Max 15 pts)
+        if est_val >= 500000:
             score += 15
-        score += min(int((position_increase_pct / 50) * 20), 20)
+        elif est_val >= 100000:
+            score += 10
+        elif est_val >= 50000:
+            score += 5
+
+        # Factor B: Relative Personal Stake Expansion (Max 25 pts)
+        if est_val >= 50000:
+            if position_increase_pct >= 50.0:
+                score += 25
+            elif position_increase_pct >= 25.0:
+                score += 18
+            elif position_increase_pct >= 10.0:
+                score += 10
+
+        # Factor C: Multi-Insider Consensus (Max 30 pts)
+        if distinct_csuite_insiders >= 2:
+            score += 30
+        elif distinct_all_insiders >= 3:
+            score += 25
+        elif distinct_all_insiders == 2:
+            score += 15
+
+        # Factor D: Operational Role Authority (Max 20 pts)
+        if is_tier1:
+            score += 20
+        elif is_tier2:
+            score += 10
+        else:
+            score += 5
+
         score = min(max(score, 10), 100)
         scores.append(score)
 
+        # Signal Flags
         trade_emojis = []
-        if price_30d_change <= -10.0 and is_csuite and est_val >= 50000:
-            trade_emojis.append("🎯")
-        if unique_insiders >= 2:
-            trade_emojis.append("🔥")
-        if is_csuite and distinct_buy_days >= 2:
-            trade_emojis.append("⚡")
-        if position_increase_pct >= 10.0 and est_val >= 50000:
-            trade_emojis.append("🚀")
-        if sector_volumes.loc[idx] > (
-            avg_sector_vol * 1.5
-        ) and sector not in ["Unclassified", "Private Credit & Funds"]:
-            trade_emojis.append("🌐")
+        if distinct_csuite_insiders >= 2 or distinct_all_insiders >= 3:
+            trade_emojis.append("🔥")  # Cluster Consensus
+        if is_tier1 and est_val >= 100000:
+            trade_emojis.append("⚡")  # Operational Leadership Buy
+        if position_increase_pct >= 25.0 and est_val >= 50000:
+            trade_emojis.append("🚀")  # Major Skin-in-the-Game
 
         flags.append(" ".join(trade_emojis) if trade_emojis else "—")
 
@@ -404,11 +448,9 @@ try:
         st.sidebar.markdown("---")
         st.sidebar.markdown("### 📖 Signal Legend")
         st.sidebar.markdown("""
-        * **🎯** **Bullish Divergence** (10%+ stock dip with C-suite buying)
-        * **🔥** **Cluster** (2+ insiders in prior 60d)
-        * **⚡** **C-Suite Accumulation** (Repeat buying by execs)
-        * **🚀** **Skin-in-the-Game** (10%+ position increase, $50k+)
-        * **🌐** **Sector Rotation** (High volume burst in sector)
+        * **🔥** **Cluster Consensus** (2+ distinct C-Suite/execs buying within 30 days)
+        * **⚡** **Operational Leadership** (CEO, CFO, or COO purchase $\ge \$100k$)
+        * **🚀** **Skin-in-the-Game** ($\ge 25\%$ personal position expansion, $\ge \$50k$)
         """)
 
         st.sidebar.markdown("---")
