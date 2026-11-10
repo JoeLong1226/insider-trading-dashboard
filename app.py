@@ -137,14 +137,14 @@ def calculate_trade_performance(
 def process_advanced_conviction_metrics(df):
     """Institutional Conviction Score Architecture v2.2.
 
-    Balanced scoring to prevent Score 100 crowding while rewarding
-    multi-insider cluster consensus, relative skin-in-the-game, and trend health.
+    Balanced scoring with detailed sub-score logging for transparent tooltips.
     """
     df["parsed_date"] = pd.to_datetime(df["transaction_date"].astype(str).str[:10])
     df = df.sort_values(by="parsed_date", ascending=True).reset_index(drop=True)
 
     flags = []
     scores = []
+    explanations = []
 
     for idx, row in df.iterrows():
         current_date = row["parsed_date"]
@@ -190,55 +190,74 @@ def process_advanced_conviction_metrics(df):
         is_admin_or_other = any(t in title for t in ["ACCOUNTING", "SECRETARY", "COUNSEL", "SEE REMARKS"])
 
         score = 10  # Base score
+        breakdown = ["Base: 10"]
 
         # Factor A: Market Cap Adjustment
         if 0 < market_cap < 50000000:
-            score -= 10  # Micro-cap distress penalty
+            score -= 10
+            breakdown.append("Micro-cap penalty: -10")
         elif market_cap >= 500000000:
-            score += 10  # Stability bonus
+            score += 10
+            breakdown.append("Stability bonus: +10")
 
-        # Factor B: Operational Role Weighting (Capped for admin/support roles)
+        # Factor B: Operational Role Weighting
         if is_tier1:
             score += 20
+            breakdown.append("C-Suite role (CEO/CFO/COO): +20")
         elif is_tier2:
             score += 12
+            breakdown.append("Executive role: +12")
         elif is_admin_or_other:
             score += 2
+            breakdown.append("Admin/Support role: +2")
         else:
             score += 8
+            breakdown.append("Standard Director/Officer: +8")
 
         # Factor C: Relative Personal Stake Expansion
         if position_increase_pct >= 100.0:
             score += 25
+            breakdown.append(f"Position doubled ({position_increase_pct:.1f}%): +25")
         elif position_increase_pct >= 50.0:
             score += 15
+            breakdown.append(f"Position increased 50%+ ({position_increase_pct:.1f}%): +15")
         elif position_increase_pct >= 10.0:
             score += 8
+            breakdown.append(f"Position increased 10%+ ({position_increase_pct:.1f}%): +8")
 
         # Factor D: Absolute Dollar Commitment
         if est_val >= 500000:
             score += 15
+            breakdown.append("Large $500k+ purchase: +15")
         elif est_val >= 100000:
             score += 8
+            breakdown.append("Substantial $100k+ purchase: +8")
 
-        # Factor E: Multi-Insider Consensus Bonus (Primary driver of top tiers)
+        # Factor E: Multi-Insider Consensus Bonus
         if distinct_csuite_insiders >= 2:
             score += 30
+            breakdown.append("C-Suite Cluster Consensus: +30")
         elif distinct_all_insiders >= 3:
             score += 20
+            breakdown.append("Multi-Insider Cluster (3+): +20")
         elif distinct_all_insiders == 2:
             score += 10
+            breakdown.append("Multi-Insider Buy (2): +10")
 
-        # Factor F: Trend Filter (Stricter Falling-Knife Penalty)
+        # Factor F: Trend Filter (Falling-Knife Penalty)
         if price_30d < -30.0:
-            score -= 25  # Heavy penalty for buying deep value traps
+            score -= 25
+            breakdown.append(f"Deep drop value trap filter ({price_30d:.1f}%): -25")
         elif price_30d < -15.0:
             score -= 10
+            breakdown.append(f"Moderate drop filter ({price_30d:.1f}%): -10")
         elif -10.0 <= price_30d <= 15.0:
-            score += 10  # Consolidation bonus
+            score += 10
+            breakdown.append("Stable consolidation zone: +10")
 
-        score = min(max(score, 0), 100)
-        scores.append(score)
+        final_score = min(max(score, 0), 100)
+        scores.append(final_score)
+        explanations.append(" | ".join(breakdown))
 
         # Signal Flags
         trade_emojis = []
@@ -253,6 +272,7 @@ def process_advanced_conviction_metrics(df):
 
     df["Conviction Score"] = scores
     df["High Conviction Flag"] = flags
+    df["Score Breakdown"] = explanations
     return df.sort_values(by="parsed_date", ascending=False).reset_index(
         drop=True
     )
@@ -397,6 +417,18 @@ try:
             lambda x: f"${x:,.0f}" if pd.notnull(x) else "$0"
         )
 
+        # Explicit Tier Labeling for Website Visitors
+        def assign_tier_label(score):
+            if score >= 70:
+                return f"⭐ Executive Consensus ({score})"
+            elif score >= 50:
+                return f"🟢 High Conviction ({score})"
+            elif score >= 30:
+                return f"🟡 Moderate ({score})"
+            return f"⚪ Low ({score})"
+
+        df["Conviction Tier"] = df["Conviction Score"].apply(assign_tier_label)
+
         current_date = pd.to_datetime("2026-11-10")
 
         def format_gain(row):
@@ -437,8 +469,10 @@ try:
         )
 
         st.sidebar.markdown("---")
-        st.sidebar.markdown("### 📖 Signal Legend")
+        st.sidebar.markdown("### 📖 Signal & Tier Legend")
         st.sidebar.markdown("""
+        * **⭐ Executive Consensus (70+)**: Top-tier cluster buying & skin-in-the-game.
+        * **🟢 High Conviction (50-69)**: Strong standalone executive purchase.
         * **🔥** **Cluster Consensus** (2+ distinct C-Suite/execs buying within 30 days)
         * **⚡** **Operational Leadership** (CEO, CFO, or COO purchase $\ge \$100k$)
         * **🚀** **Skin-in-the-Game** ($\ge 25\%$ personal position expansion, $\ge \$50k$)
@@ -487,7 +521,7 @@ try:
 
             display_df = display_source[[
                 "transaction_date",
-                "Conviction Score",
+                "Conviction Tier",
                 "High Conviction Flag",
                 "ticker",
                 "sector",
@@ -502,11 +536,12 @@ try:
                 "benchmark_ticker",
                 "Benchmark Return",
                 "Alpha Return",
+                "Score Breakdown",
             ]]
 
             display_df.columns = [
                 "Transaction Date",
-                "Score",
+                "Conviction Tier",
                 "Signals",
                 "Ticker",
                 "Sector",
@@ -521,6 +556,7 @@ try:
                 "Benchmark",
                 "Benchmark Return",
                 "Alpha vs Benchmark",
+                "Score Breakdown (Why this score?)",
             ]
 
             st.dataframe(display_df, use_container_width=True)
