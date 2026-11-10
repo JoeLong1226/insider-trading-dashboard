@@ -420,12 +420,12 @@ try:
         # Explicit Tier Labeling for Website Visitors
         def assign_tier_label(score):
             if score >= 70:
-                return f"⭐ Executive Consensus ({score})"
+                return "⭐ Executive Consensus"
             elif score >= 50:
-                return f"🟢 High Conviction ({score})"
+                return "🟢 High Conviction"
             elif score >= 30:
-                return f"🟡 Moderate ({score})"
-            return f"⚪ Low ({score})"
+                return "🟡 Moderate"
+            return "⚪ Low"
 
         df["Conviction Tier"] = df["Conviction Score"].apply(assign_tier_label)
 
@@ -519,8 +519,10 @@ try:
 
             st.subheader("📋 Insider Transactions Database")
 
+            # Separating Score (numeric) and Conviction Tier (badge) so users can filter/sort numerically on Score!
             display_df = display_source[[
                 "transaction_date",
+                "Conviction Score",
                 "Conviction Tier",
                 "High Conviction Flag",
                 "ticker",
@@ -541,7 +543,8 @@ try:
 
             display_df.columns = [
                 "Transaction Date",
-                "Conviction Tier",
+                "Score",
+                "Tier",
                 "Signals",
                 "Ticker",
                 "Sector",
