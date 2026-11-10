@@ -135,11 +135,10 @@ def calculate_trade_performance(
 
 
 def process_advanced_conviction_metrics(df):
-    """Institutional Conviction Score Architecture v2.1.
+    """Institutional Conviction Score Architecture v2.2.
 
-    Re-engineered to incorporate relative skin-in-the-game, multi-insider
-    consensus, operational role authority, consolidated trade sizing,
-    micro-cap noise suppression, and falling-knife trend filters.
+    Balanced scoring to prevent Score 100 crowding while rewarding
+    multi-insider cluster consensus, relative skin-in-the-game, and trend health.
     """
     df["parsed_date"] = pd.to_datetime(df["transaction_date"].astype(str).str[:10])
     df = df.sort_values(by="parsed_date", ascending=True).reset_index(drop=True)
@@ -183,53 +182,60 @@ def process_advanced_conviction_metrics(df):
 
         distinct_all_insiders = window_df["insider_name"].nunique()
 
-        # 3. Role Tiering
+        # 3. Role Categorization
         is_tier1 = any(
             t in title for t in ["CEO", "CFO", "COO", "CHIEF EXECUTIVE", "CHIEF FINANCIAL", "CHIEF OPERATING"]
         )
         is_tier2 = any(t in title for t in ["PRESIDENT", "VP", "VICE PRESIDENT"]) and not is_tier1
+        is_admin_or_other = any(t in title for t in ["ACCOUNTING", "SECRETARY", "COUNSEL", "SEE REMARKS"])
 
-        score = 15  # Base score
+        score = 10  # Base score
 
-        # Factor A: Market Cap Adjustment (penalize extreme micro-cap distress noise < $50M)
+        # Factor A: Market Cap Adjustment
         if 0 < market_cap < 50000000:
-            score -= 10
-        elif market_cap >= 500000000:  # Mid/Large cap stability bonus
-            score += 10
+            score -= 10  # Micro-cap distress penalty
+        elif market_cap >= 500000000:
+            score += 10  # Stability bonus
 
-        # Factor B: Operational Role Authority
+        # Factor B: Operational Role Weighting (Capped for admin/support roles)
         if is_tier1:
-            score += 25
+            score += 20
         elif is_tier2:
-            score += 15
+            score += 12
+        elif is_admin_or_other:
+            score += 2
         else:
-            score += 5
+            score += 8
 
         # Factor C: Relative Personal Stake Expansion
         if position_increase_pct >= 100.0:
-            score += 30
+            score += 25
         elif position_increase_pct >= 50.0:
-            score += 20
+            score += 15
         elif position_increase_pct >= 10.0:
-            score += 10
+            score += 8
 
         # Factor D: Absolute Dollar Commitment
         if est_val >= 500000:
-            score += 20
+            score += 15
         elif est_val >= 100000:
-            score += 10
+            score += 8
 
-        # Factor E: Multi-Insider Consensus Bonus
+        # Factor E: Multi-Insider Consensus Bonus (Primary driver of top tiers)
         if distinct_csuite_insiders >= 2:
-            score += 25
+            score += 30
         elif distinct_all_insiders >= 3:
             score += 20
+        elif distinct_all_insiders == 2:
+            score += 10
 
-        # Factor F: Trend Filter (Avoid Falling Knives)
-        if price_30d < -30.0:  # Stock crashed >30% before purchase (value trap risk)
-            score -= 20
-        elif -15.0 <= price_30d <= 15.0:  # Stable accumulation / consolidation zone
-            score += 15
+        # Factor F: Trend Filter (Stricter Falling-Knife Penalty)
+        if price_30d < -30.0:
+            score -= 25  # Heavy penalty for buying deep value traps
+        elif price_30d < -15.0:
+            score -= 10
+        elif -10.0 <= price_30d <= 15.0:
+            score += 10  # Consolidation bonus
 
         score = min(max(score, 0), 100)
         scores.append(score)
