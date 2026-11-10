@@ -137,7 +137,7 @@ def calculate_trade_performance(
 def process_advanced_conviction_metrics(df):
     """Institutional Conviction Score Architecture v2.2.
 
-    Balanced scoring with detailed sub-score logging for transparent tooltips.
+    Balanced scoring with detailed sub-score logging for transparent audit trails.
     """
     df["parsed_date"] = pd.to_datetime(df["transaction_date"].astype(str).str[:10])
     df = df.sort_values(by="parsed_date", ascending=True).reset_index(drop=True)
@@ -417,7 +417,7 @@ try:
             lambda x: f"${x:,.0f}" if pd.notnull(x) else "$0"
         )
 
-        # Explicit Tier Labeling for Website Visitors
+        # Tier Labeling for Visual Badges
         def assign_tier_label(score):
             if score >= 70:
                 return "⭐ Executive Consensus"
@@ -519,7 +519,7 @@ try:
 
             st.subheader("📋 Insider Transactions Database")
 
-            # Separating Score (numeric) and Conviction Tier (badge) so users can filter/sort numerically on Score!
+            # Clean table with separate numeric Score and visual Tier badge
             display_df = display_source[[
                 "transaction_date",
                 "Conviction Score",
@@ -538,7 +538,6 @@ try:
                 "benchmark_ticker",
                 "Benchmark Return",
                 "Alpha Return",
-                "Score Breakdown",
             ]]
 
             display_df.columns = [
@@ -559,10 +558,41 @@ try:
                 "Benchmark",
                 "Benchmark Return",
                 "Alpha vs Benchmark",
-                "Score Breakdown (Why this score?)",
             ]
 
             st.dataframe(display_df, use_container_width=True)
+
+            # --- INTERACTIVE INSPECT CARD BELOW THE TABLE ---
+            st.markdown("### 🔍 Inspect Score Breakdown")
+            st.write("Select any transaction below to audit its exact scoring components:")
+
+            if not display_source.empty:
+                display_source["Select Label"] = (
+                    display_source["ticker"] + " — " + 
+                    display_source["insider_name"] + " (" + 
+                    display_source["transaction_date"].astype(str).str[:10] + 
+                    " | Score: " + display_source["Conviction Score"].astype(str) + ")"
+                )
+                
+                selected_trade_label = st.selectbox(
+                    "Choose a transaction to inspect:",
+                    display_source["Select Label"].tolist()
+                )
+
+                selected_row = display_source[
+                    display_source["Select Label"] == selected_trade_label
+                ].iloc[0]
+
+                col_a, col_b = st.columns([1, 2])
+                with col_a:
+                    st.metric("Conviction Score", f"{selected_row['Conviction Score']} / 100")
+                    st.write(f"**Tier:** {selected_row['Conviction Tier']}")
+                    st.write(f"**Signals:** {selected_row['High Conviction Flag']}")
+                with col_b:
+                    st.markdown("**Scoring Audit Trail:**")
+                    components = selected_row["Score Breakdown"].split(" | ")
+                    for comp in components:
+                        st.markdown(f"- {comp}")
 
         with tab2:
             st.subheader("🏆 Aggregate Insider Performance Leaderboard")
