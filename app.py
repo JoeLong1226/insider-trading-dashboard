@@ -1,9 +1,9 @@
+from datetime import datetime
 import os
 import pandas as pd
 import psycopg2
 import streamlit as st
 import yfinance as yf
-from datetime import datetime
 
 st.set_page_config(
     page_title="Insider Trading Dashboard",
@@ -23,7 +23,7 @@ def get_db_connection():
 def get_stock_sector(ticker):
     if not ticker or ticker.upper() in ["UNKNOWN", "NONE", "NULL", "N/A"]:
         return "Unclassified"
-    
+
     sector_fallbacks = {
         "PBPB": "Consumer Cyclical",
         "TTSH": "Healthcare",
@@ -44,21 +44,25 @@ def get_stock_sector(ticker):
 
 
 @st.cache_data(ttl=86400)  # Cache benchmark & stock performance
-def calculate_trade_performance(ticker, benchmark_ticker, tx_date_str, shares, est_value_db):
+def calculate_trade_performance(
+    ticker, benchmark_ticker, tx_date_str, shares, est_value_db
+):
     if (
         not ticker
         or ticker.upper() in ["UNKNOWN", "NONE", "NULL", "N/A"]
         or shares <= 0
     ):
         return 0.0, 0.0, 0.0, est_value_db, 0.0, 0.0
-    
+
     clean_date_str = str(tx_date_str)[:10]
     cleaned_ticker = ticker.replace(".", "-")
-    
+
     try:
         stock = yf.Ticker(cleaned_ticker)
         tx_date = pd.to_datetime(clean_date_str)
-        current_price = stock.fast_info.get("lastPrice") or stock.info.get("currentPrice")
+        current_price = stock.fast_info.get("lastPrice") or stock.info.get(
+            "currentPrice"
+        )
         hist = stock.history(start=clean_date_str)
         if hist.empty:
             return 0.0, 0.0, 0.0, est_value_db, 0.0, 0.0
@@ -107,9 +111,13 @@ def calculate_trade_performance(ticker, benchmark_ticker, tx_date_str, shares, e
                 b_hist = b_stock.history(start=clean_date_str)
                 if not b_hist.empty and len(b_hist) >= 1:
                     b_start_price = b_hist["Close"].iloc[0]
-                    b_current_price = b_stock.fast_info.get("lastPrice") or b_hist["Close"].iloc[-1]
+                    b_current_price = b_stock.fast_info.get(
+                        "lastPrice"
+                    ) or b_hist["Close"].iloc[-1]
                     if b_start_price > 0:
-                        benchmark_pct_return = ((b_current_price - b_start_price) / b_start_price) * 100.0
+                        benchmark_pct_return = (
+                            (b_current_price - b_start_price) / b_start_price
+                        ) * 100.0
             except Exception:
                 pass
 
@@ -230,6 +238,24 @@ try:
     selected_year = st.sidebar.selectbox(
         "Filter by Year", ["All Years", "2026", "2025", "2024", "Older"]
     )
+
+    months = [
+        "All Months",
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ]
+    selected_month = st.sidebar.selectbox("Filter by Month", months, index=0)
+
     max_rows = st.sidebar.slider(
         "Max Rows to Load & Analyze", 50, 1000, 200, step=50
     )
@@ -271,15 +297,33 @@ try:
     df = pd.read_sql(query, conn)
 
     if not df.empty:
+        df["filing_date"] = pd.to_datetime(df["transaction_date"])
+
+        if selected_month != "All Months":
+            month_num = months.index(selected_month)
+            df = df[df["filing_date"].dt.month == month_num]
+
         df["sector"] = df.apply(
-            lambda row: get_stock_sector(row["ticker"]) if row["sector"] in ["Unclassified", None, ""] else row["sector"],
-            axis=1
+            lambda row: get_stock_sector(row["ticker"])
+            if row["sector"] in ["Unclassified", None, ""]
+            else row["sector"],
+            axis=1,
         )
 
         if hide_institutions:
-            fund_keywords = ["LLC", "L.P.", "PARTNERS", "FUNDS", "CAPITAL", "INVESTMENT", "MANAGEMENT"]
-            pattern = '|'.join(fund_keywords)
-            df = df[~df['insider_name'].str.upper().str.contains(pattern, na=False)].reset_index(drop=True)
+            fund_keywords = [
+                "LLC",
+                "L.P.",
+                "PARTNERS",
+                "FUNDS",
+                "CAPITAL",
+                "INVESTMENT",
+                "MANAGEMENT",
+            ]
+            pattern = "|".join(fund_keywords)
+            df = df[
+                ~df["insider_name"].str.upper().str.contains(pattern, na=False)
+            ].reset_index(drop=True)
 
     if not df.empty:
         perf = [
@@ -346,7 +390,7 @@ try:
 
         st.sidebar.markdown("---")
         st.sidebar.markdown("### 💾 Export Data")
-        csv_export = df.to_csv(index=False).encode('utf-8')
+        csv_export = df.to_csv(index=False).encode("utf-8")
         st.sidebar.download_button(
             label="📥 Download Current Data (CSV)",
             data=csv_export,
@@ -385,7 +429,6 @@ try:
 
             st.subheader("📋 Insider Transactions Database")
 
-            # Structured with core info on left, and Market Cap / Benchmark metrics cleanly on the right
             display_df = display_source[[
                 "transaction_date",
                 "Conviction Score",
