@@ -1,75 +1,124 @@
-import os
 from datetime import datetime, timedelta
-import yfinance as yf
+import os
+import re
+import time
+import pandas as pd
 import psycopg2
+import yfinance as yf
 
-def get_forward_prices(ticker_symbol, tx_date_str):
-    cleaned_ticker = ticker_symbol.strip().upper()
+SUPABASE_URL = os.environ.get("SUPABASE_DB_URL")
+
+
+def get_db_connection():
+    if not SUPABASE_URL:
+        raise ValueError("Missing database connection string. Set SUPABASE_DB_URL.")
+    return psycopg2.connect(SUPABASE_URL)
+
+
+def clean_ticker_for_yf(ticker):
+    if not ticker: return ""
+    clean = str(ticker).strip().upper()
+    clean = clean.replace('"', '').replace("'", "").replace('(', '').replace(')', '').replace('[', '').replace(']', '')
+    if ":" in clean: clean = clean.split(":")[-1].strip()
+    clean = re.sub(r'[\s]', '', clean)
+    if "," in clean: clean = clean.split(",")[0].strip()
+    elif "/" in clean: clean = clean.split("/")[0].strip()
+    return {"LBTY": "LBTYA", "GOOG": "GOOGL", "BRK.B": "BRK-B"}.get(clean, clean)
+
+
+def fetch_prices_for_date(ticker_symbol, tx_date_str):
+    cleaned_ticker = clean_ticker_for_yf(ticker_symbol)
+    if not cleaned_ticker or len(cleaned_ticker) > 6 or not re.match(r'^[A-Z0-9\.\-]+$', cleaned_ticker):
+        return None, None, None
+
     try:
         tx_date = datetime.strptime(tx_date_str.strip()[:10], '%Y-%m-%d').date()
         start_date = tx_date - timedelta(days=5)
-        end_date = tx_date + timedelta(days=260)
+        end_date_forward = tx_date + timedelta(days=190)
 
         t = yf.Ticker(cleaned_ticker)
-        hist = t.history(start=str(start_date), end=str(end_date))
-        
+        hist = t.history(start=str(start_date), end=str(end_date_forward))
         if hist.empty or 'Close' not in hist.columns:
             return None, None, None
-
+             
         hist.index = hist.index.date
-        
-        # 1. Price at Transaction
+
+        # 1. Price at transaction date
         if tx_date in hist.index:
-            price_tx = float(hist.loc[tx_date, 'Close'])
+            price_at_tx = float(hist.loc[tx_date, 'Close'])
         else:
-            past_dates = hist[hist.index <= tx_date]
-            if past_dates.empty:
-                return None, None, None
-            price_tx = float(past_dates.iloc[-1]['Close'])
+            hist['diff'] = abs(pd.to_datetime(hist.index) - pd.to_datetime(tx_date))
+            price_at_tx = float(hist.loc[hist['diff'].idxmin(), 'Close'])
 
-        # 2. Price ~60 days after
-        target_60 = tx_date + timedelta(days=85)
-        future_60 = hist[(hist.index >= tx_date + timedelta(days=40)) & (hist.index <= target_60)]
-        price_60 = float(future_60.iloc[0]['Close']) if not future_60.empty else None
+        # 2. Forward Prices (60d and 180d after)
+        price_60d = None
+        price_180d = None
+        target_60d = tx_date + timedelta(days=60)
+        target_180d = tx_date + timedelta(days=180)
 
-        # 3. Price ~180 days after
-        target_180 = tx_date + timedelta(days=260)
-        future_180 = hist[(hist.index >= tx_date + timedelta(days=150)) & (hist.index <= target_180)]
-        price_180 = float(future_180.iloc[0]['Close']) if not future_180.empty else None
+        future_hist = hist[hist.index >= tx_date]
+        if not future_hist.empty:
+            future_60 = future_hist[future_hist.index >= target_60d]
+            if not future_60.empty:
+                price_60d = float(future_60.iloc[0]['Close'])
 
-        return price_tx, price_60, price_180
+            future_180 = future_hist[future_hist.index >= target_180d]
+            if not future_180.empty:
+                price_180d = float(future_180.iloc[0]['Close'])
+
+        return price_at_tx, price_60d, price_180d
     except Exception:
         return None, None, None
 
-def patch_missing_prices():
-    conn_url = os.environ.get("SUPABASE_DB_URL")
-    conn = psycopg2.connect(conn_url)
-    conn.autocommit = True
+
+def update_missing_prices(start_date_filter="2026-04-01", end_date_filter="2026-04-30"):
+    conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Fetch rows that don't have price_at_tx populated yet
-    cursor.execute("""
-        SELECT accession_number, ticker, transaction_date 
+    # Select existing records where prices haven't been populated yet within the target window
+    select_query = """
+        SELECT id, ticker, transaction_date 
         FROM insider_trades 
-        WHERE price_at_tx IS NULL AND accession_number IS NOT NULL;
-    """)
+        WHERE price_at_tx IS NULL 
+          AND transaction_date >= %s 
+          AND transaction_date <= %s
+    """
+    
+    cursor.execute(select_query, (start_date_filter, end_date_filter))
     rows = cursor.fetchall()
-    print(f"Found {len(rows)} rows to patch with forward prices.")
+    print(f"Found {len(rows)} records needing price updates between {start_date_filter} and {end_date_filter}.")
 
-    for accession_number, ticker, tx_date in rows:
-        price_tx, price_60, price_180 = get_forward_prices(ticker, tx_date)
+    update_query = """
+        UPDATE insider_trades 
+        SET price_at_tx = %s, price_60d_after = %s, price_180d_after = %s
+        WHERE id = %s
+    """
+
+    updated_count = 0
+    for row_id, ticker, tx_date in rows:
+        price_at_tx, price_60d, price_180d = fetch_prices_for_date(ticker, str(tx_date))
         
-        if price_tx is not None:
-            cursor.execute("""
-                UPDATE insider_trades 
-                SET price_at_tx = %s, price_60d_after = %s, price_180d_after = %s
-                WHERE accession_number = %s;
-            """, (price_tx, price_60, price_180, accession_number))
-            print(f"Patched {ticker} on {tx_date} (Accession: {accession_number})")
+        if price_at_tx is not None:
+            try:
+                cursor.execute(update_query, (price_at_tx, price_60d, price_180d, row_id))
+                conn.commit()
+                updated_count += 1
+                print(f"Updated ID {row_id} ({ticker} on {tx_date}): Tx=${price_at_tx:.2f}")
+            except Exception as db_err:
+                conn.rollback()
+                print(f"DB Update Error for ID {row_id}: {db_err}")
+        
+        time.sleep(0.2)  # Gentle rate limit for Yahoo Finance
 
     cursor.close()
     conn.close()
-    print("Patching complete!")
+    print(f"--- Finished price patch. Successfully updated {updated_count} records. ---")
+
 
 if __name__ == "__main__":
-    patch_missing_prices()
+    import sys
+    # Optional CLI args: python update_prices.py 2026-04-01 2026-04-30
+    if len(sys.argv) >= 3:
+        update_missing_prices(sys.argv[1], sys.argv[2])
+    else:
+        update_missing_prices("2026-04-01", "2026-04-30")
