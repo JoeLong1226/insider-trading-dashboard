@@ -7,6 +7,7 @@ from edgar import get_filings, set_identity
 import yfinance as yf
 import psycopg2
 
+# Set your SEC identity required for all edgartools calls
 set_identity("JosephLong1226@gmail.com")
 
 FUND_CIK_MAP = {
@@ -119,16 +120,17 @@ def get_ticker_metadata(ticker_symbol):
 def run_market_wide_etl(start_date=None, end_date=None):
     if start_date and end_date:
         date_query = f"{start_date}:{end_date}"
-        print(f"Fetching Form 4 filings for date range: {date_query}...")
+        print(f"Fetching Form 4 & 4/A filings for date range: {date_query}...")
     elif start_date:
         date_query = f"{start_date}:"
-        print(f"Fetching Form 4 filings from {start_date} onwards...")
+        print(f"Fetching Form 4 & 4/A filings from {start_date} onwards...")
     else:
         start_date = (datetime.date.today() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')
         date_query = f"{start_date}:"
-        print(f"Fetching recent Form 4 filings from {start_date}...")
+        print(f"Fetching recent Form 4 & 4/A filings from {start_date}...")
 
-    filings = get_filings(form="4", filing_date=date_query)
+    # Fetch both Form 4 and Form 4/A (amendments)
+    filings = get_filings(form=["4", "4/A"], filing_date=date_query)
     parsed_transactions = []
 
     conn_url = os.environ.get("SUPABASE_DB_URL")
@@ -136,6 +138,7 @@ def run_market_wide_etl(start_date=None, end_date=None):
     conn.autocommit = True
     cursor = conn.cursor()
 
+    # Ensure table includes accession_number for tracking amendments
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS insider_trades (
             id SERIAL PRIMARY KEY,
@@ -148,12 +151,13 @@ def run_market_wide_etl(start_date=None, end_date=None):
             shares_owned_following BIGINT,
             est_value NUMERIC,
             activity_type TEXT,
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-            CONSTRAINT unique_trade UNIQUE (transaction_date, ticker, insider_name, shares_bought, est_value)
+            accession_number TEXT UNIQUE,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
     """)
     
     alter_statements = [
+        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS accession_number TEXT;",
         "ALTER TABLE insider_trades ALTER COLUMN market_cap TYPE NUMERIC;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap NUMERIC;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap_category TEXT;",
@@ -166,15 +170,19 @@ def run_market_wide_etl(start_date=None, end_date=None):
     for stmt in alter_statements:
         try:
             cursor.execute(stmt)
-            print(f"Executed: {stmt}")
-        except Exception as e:
-            print(f"Note on statement '{stmt}': {e}")
+        except Exception:
+            pass
 
     for filing in filings:
         try:
             xml_content = filing.xml()
             if not xml_content: continue
             root = ET.fromstring(xml_content)
+
+            accession_number = getattr(filing, 'accession_number', None) or root.findtext(".//accessionNumber", "")
+            if not accession_number:
+                # Fallback unique string if accession attribute is missing
+                accession_number = str(filing.filing_date) + "_" + root.findtext(".//issuer/issuerCik", "")
 
             raw_ticker = root.findtext(".//issuer/issuerTradingSymbol", "").strip().upper()
             issuer_name = root.findtext(".//issuer/issuerName", "").strip()
@@ -239,7 +247,8 @@ def run_market_wide_etl(start_date=None, end_date=None):
                         "market_cap": float(mcap) if mcap else None,
                         "market_cap_category": mcap_category,
                         "benchmark_ticker": benchmark,
-                        "activity_type": "Purchase"
+                        "activity_type": "Purchase",
+                        "accession_number": accession_number
                     })
         except Exception:
             continue
@@ -255,20 +264,26 @@ def run_market_wide_etl(start_date=None, end_date=None):
             INSERT INTO insider_trades (
                 transaction_date, ticker, sector, insider_name, insider_title, 
                 shares_bought, shares_owned_following, est_value, 
-                market_cap, market_cap_category, benchmark_ticker, activity_type
+                market_cap, market_cap_category, benchmark_ticker, activity_type, accession_number
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (transaction_date, ticker, insider_name, shares_bought, est_value) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (accession_number) 
             DO UPDATE SET 
+                transaction_date = EXCLUDED.transaction_date,
+                ticker = EXCLUDED.ticker,
                 sector = EXCLUDED.sector, 
+                insider_name = EXCLUDED.insider_name,
                 insider_title = EXCLUDED.insider_title,
+                shares_bought = EXCLUDED.shares_bought,
+                shares_owned_following = EXCLUDED.shares_owned_following,
+                est_value = EXCLUDED.est_value,
                 market_cap = EXCLUDED.market_cap,
                 market_cap_category = EXCLUDED.market_cap_category,
                 benchmark_ticker = EXCLUDED.benchmark_ticker;
         """, (
             row["transaction_date"], row["ticker"], row["sector"], row["insider_name"], row["insider_title"],
             row["shares_bought"], row["shares_owned_following"], row["est_value"],
-            row["market_cap"], row["market_cap_category"], row["benchmark_ticker"], row["activity_type"]
+            row["market_cap"], row["market_cap_category"], row["benchmark_ticker"], row["activity_type"], row["accession_number"]
         ))
 
     cursor.close()
