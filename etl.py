@@ -36,7 +36,7 @@ def safe_bigint(val):
 
 def clean_ticker_for_yf(ticker):
     if not ticker: return ticker
-    clean = ticker.replace(".", "-").upper()
+    clean = str(ticker).replace(".", "-").upper()
     return TICKER_ALIASES.get(clean, clean)
 
 def resolve_ticker(raw_ticker, issuer_name, issuer_cik=""):
@@ -48,8 +48,16 @@ def resolve_ticker(raw_ticker, issuer_name, issuer_cik=""):
     if "BLUEROCK" in name_upper or "BLUROCK" in name_upper: return "BPRE"
     if "BLACKSTONE PRIVATE REAL ESTATE CREDIT" in name_upper: return "BREC"
 
-    if not raw_ticker or not isinstance(raw_ticker, str): return None
-    clean = raw_ticker.strip().upper().replace("[", "").replace("]", "")
+    # Fallback parsing for raw ticker
+    if not raw_ticker or not isinstance(raw_ticker, str):
+        # Try extracting ticker from issuer name brackets if raw_ticker is empty (e.g. [ STLN ])
+        match = re.search(r'\[\s*([A-Z0-9.\-]+)\s*\]', issuer_name)
+        if match:
+            raw_ticker = match.group(1)
+        else:
+            return None
+
+    clean = str(raw_ticker).strip().upper().replace("[", "").replace("]", "")
     if clean in ["NONE", "NULL", "N/A", "UNKNOWN", "UNKNO", "BLACK", "BLACKS", "VISTA", "5C"]: return None
     if bool(re.match(r"^[A-Z0-9.\-]+$", clean)) and len(clean) <= 6: return clean
     return None
@@ -62,7 +70,7 @@ def infer_sector_from_name(company_name):
         return "Consumer Cyclical"
     if any(k in name for k in ["ENERGY", "OIL", "GAS", "POWER", "ELECTRIC"]):
         return "Utilities"
-    if any(k in name for k in ["PHARMA", "HEALTH", "BIOTECH", "MEDICAL", "THERAPEUTICS"]):
+    if any(k in name for k in ["PHARMA", "HEALTH", "BIOTECH", "MEDICAL", "THERAPEUTICS", "ONCOLOGY"]):
         return "Healthcare"
     if any(k in name for k in ["BANK", "FINANCIAL", "CAPITAL", "INVESTMENT", "FUND"]):
         return "Financial Services"
@@ -94,7 +102,7 @@ def get_sector_for_ticker(ticker, issuer_name=""):
 
 def assign_market_cap_tier(market_cap_val):
     if not market_cap_val or market_cap_val <= 0:
-        return 'Unknown', None
+        return 'Micro/Small', 'IWM' # Safe fallback for micro-cap / newly issued equities
     if market_cap_val < 2_000_000_000:
         return 'Micro/Small', 'IWM'
     elif 2_000_000_000 <= market_cap_val <= 10_000_000_000:
@@ -104,18 +112,21 @@ def assign_market_cap_tier(market_cap_val):
 
 def get_ticker_metadata(ticker_symbol):
     if not ticker_symbol or ticker_symbol in ['NONE', '[NONE]']:
-        return None, 'Unknown', None
+        return None, 'Micro/Small', 'IWM'
     cleaned_ticker = clean_ticker_for_yf(ticker_symbol)
     try:
         t = yf.Ticker(cleaned_ticker)
-        mcap = float(t.fast_info.market_cap) if t.fast_info.market_cap else None
+        mcap = None
+        if hasattr(t, 'fast_info') and t.fast_info.market_cap:
+            mcap = float(t.fast_info.market_cap)
+        
         if not mcap or mcap <= 0:
-            return None, 'Unknown', None
+            return None, 'Micro/Small', 'IWM'
             
         category, benchmark = assign_market_cap_tier(mcap)
         return mcap, category, benchmark
     except Exception:
-        return None, 'Unknown', None
+        return None, 'Micro/Small', 'IWM'
 
 def run_market_wide_etl(start_date=None, end_date=None):
     if start_date and end_date:
@@ -129,7 +140,6 @@ def run_market_wide_etl(start_date=None, end_date=None):
         date_query = f"{start_date}:"
         print(f"Fetching recent Form 4 & 4/A filings from {start_date}...")
 
-    # Fetch both Form 4 and Form 4/A (amendments)
     filings = get_filings(form=["4", "4/A"], filing_date=date_query)
     parsed_transactions = []
 
@@ -138,7 +148,6 @@ def run_market_wide_etl(start_date=None, end_date=None):
     conn.autocommit = True
     cursor = conn.cursor()
 
-    # Ensure table includes accession_number for tracking amendments
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS insider_trades (
             id SERIAL PRIMARY KEY,
@@ -181,7 +190,6 @@ def run_market_wide_etl(start_date=None, end_date=None):
 
             accession_number = getattr(filing, 'accession_number', None) or root.findtext(".//accessionNumber", "")
             if not accession_number:
-                # Fallback unique string if accession attribute is missing
                 accession_number = str(filing.filing_date) + "_" + root.findtext(".//issuer/issuerCik", "")
 
             raw_ticker = root.findtext(".//issuer/issuerTradingSymbol", "").strip().upper()
