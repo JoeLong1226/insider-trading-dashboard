@@ -43,7 +43,7 @@ def fetch_prices_for_date(ticker_symbol, tx_date_str):
              
         hist.index = hist.index.date
 
-        # 1. Price at transaction date
+        # 1. Price at transaction date (fallback close proxy if needed, though Form 4 takes precedence if available)
         if tx_date in hist.index:
             price_at_tx = float(hist.loc[tx_date, 'Close'])
         else:
@@ -66,7 +66,9 @@ def fetch_prices_for_date(ticker_symbol, tx_date_str):
             if not future_180.empty:
                 price_180d = float(future_180.iloc[0]['Close'])
 
-        return price_at_tx, price_60d, price_180d
+        return round(price_at_tx, 2) if price_at_tx else None, \
+               round(price_60d, 2) if price_60d else None, \
+               round(price_180d, 2) if price_180d else None
     except Exception:
         return None, None, None
 
@@ -75,18 +77,17 @@ def update_missing_prices(start_date_filter="2026-04-01", end_date_filter="2026-
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Select existing records where prices haven't been populated yet within the target window
+    # AUDITOR FIX: Target all records in the window so we can reconcile/refresh them cleanly
     select_query = """
-        SELECT id, ticker, transaction_date 
+        SELECT id, ticker, transaction_date, est_value, shares_bought 
         FROM insider_trades 
-        WHERE price_at_tx IS NULL 
-          AND transaction_date >= %s 
+        WHERE transaction_date >= %s 
           AND transaction_date <= %s
     """
     
     cursor.execute(select_query, (start_date_filter, end_date_filter))
     rows = cursor.fetchall()
-    print(f"Found {len(rows)} records needing price updates between {start_date_filter} and {end_date_filter}.")
+    print(f"Found {len(rows)} records to evaluate/patch between {start_date_filter} and {end_date_filter}.")
 
     update_query = """
         UPDATE insider_trades 
@@ -95,29 +96,37 @@ def update_missing_prices(start_date_filter="2026-04-01", end_date_filter="2026-
     """
 
     updated_count = 0
-    for row_id, ticker, tx_date in rows:
-        price_at_tx, price_60d, price_180d = fetch_prices_for_date(ticker, str(tx_date))
+    for row_id, ticker, tx_date, est_value, shares_bought in rows:
+        # 1. Prioritize official Form 4 execution price if available (est_value / shares)
+        official_price = None
+        if est_value and shares_bought and shares_bought > 0:
+            official_price = round(float(est_value) / float(shares_bought), 2)
+
+        # 2. Fetch forward prices via yfinance
+        _, price_60d, price_180d = fetch_prices_for_date(ticker, str(tx_date))
         
-        if price_at_tx is not None:
+        # Use official Form 4 price for transaction date, falling back to yfinance if needed
+        final_tx_price = official_price if official_price else _
+
+        if final_tx_price is not None:
             try:
-                cursor.execute(update_query, (price_at_tx, price_60d, price_180d, row_id))
+                cursor.execute(update_query, (final_tx_price, price_60d, price_180d, row_id))
                 conn.commit()
                 updated_count += 1
-                print(f"Updated ID {row_id} ({ticker} on {tx_date}): Tx=${price_at_tx:.2f}")
+                print(f"Patched ID {row_id} ({ticker} on {tx_date}): Tx=${final_tx_price:.2f}")
             except Exception as db_err:
                 conn.rollback()
                 print(f"DB Update Error for ID {row_id}: {db_err}")
         
-        time.sleep(0.2)  # Gentle rate limit for Yahoo Finance
+        time.sleep(0.2) 
 
     cursor.close()
     conn.close()
-    print(f"--- Finished price patch. Successfully updated {updated_count} records. ---")
+    print(f"--- Finished price patch & reconciliation. Successfully updated {updated_count} records. ---")
 
 
 if __name__ == "__main__":
     import sys
-    # Optional CLI args: python update_prices.py 2026-04-01 2026-04-30
     if len(sys.argv) >= 3:
         update_missing_prices(sys.argv[1], sys.argv[2])
     else:
