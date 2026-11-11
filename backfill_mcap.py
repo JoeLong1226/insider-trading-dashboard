@@ -49,22 +49,10 @@ def get_sector_for_ticker(ticker, company_name=""):
     if not ticker or ticker in ("NONE", "UNKNOWN", "N/A", "NULL"):
         return infer_sector_from_name(company_name)
      
-    clean_ticker = ticker.strip().upper()
-    if ":" in clean_ticker:
-        clean_ticker = clean_ticker.split(":")[-1].strip()
-    clean_ticker = re.sub(r'[\[\]\s]', '', clean_ticker)
-    if "," in clean_ticker:
-        clean_ticker = clean_ticker.split(",")[0].strip()
-    elif "/" in clean_ticker:
-        clean_ticker = clean_ticker.split("/")[0].strip()
-
-    if clean_ticker in ("NYSE", "NASDAQ", "AMEX", "ARCX", "OTC", ""):
-        return infer_sector_from_name(company_name)
-
+    clean_ticker = clean_ticker_for_yf(ticker)
     if clean_ticker in sector_cache:
         return sector_cache[clean_ticker]
      
-    # Query live Yahoo Finance info for official sector classification
     try:
         t = yf.Ticker(clean_ticker)
         yf_sector = t.info.get('sector')
@@ -87,10 +75,12 @@ TICKER_ALIASES = {
 }
 
 def clean_ticker_for_yf(ticker):
-    if not ticker: return ticker
-    clean = ticker.strip().upper()
+    if not ticker: return ""
+    # Strip quotes, parentheses, brackets, spaces, and exchange prefixes
+    clean = str(ticker).strip().upper()
+    clean = clean.replace('"', '').replace("'", "").replace('(', '').replace(')', '').replace('[', '').replace(']', '')
     if ":" in clean: clean = clean.split(":")[-1].strip()
-    clean = re.sub(r'[\[\]\s]', '', clean)
+    clean = re.sub(r'[\s]', '', clean)
     if "," in clean: clean = clean.split(",")[0].strip()
     elif "/" in clean: clean = clean.split("/")[0].strip()
     return TICKER_ALIASES.get(clean, clean)
@@ -107,17 +97,22 @@ def assign_market_cap_tier(market_cap_val):
         return 'Large', 'SPY'
 
 
-# In-memory run cache so we never query Yahoo Finance twice for the same ticker+month
+# In-memory run cache
 mcap_cache = {}
 
 def get_point_in_time_metadata(ticker_symbol, tx_date_str):
     cleaned_ticker = clean_ticker_for_yf(ticker_symbol)
+    
+    # Reject invalid/non-alphabetic ticker symbols immediately (e.g. pure numbers like '1314152')
+    if not cleaned_ticker or not cleaned_ticker.isalpha() or len(cleaned_ticker) > 5:
+        return None, 'Unknown', None
+
     cache_key = f"{cleaned_ticker}_{tx_date_str[:7]}"
     if cache_key in mcap_cache:
         return mcap_cache[cache_key]
 
     try:
-        tx_date = datetime.strptime(tx_date_str.strip(), '%Y-%m-%d').date()
+        tx_date = datetime.strptime(tx_date_str.strip()[:10], '%Y-%m-%d').date()
         start_date = tx_date - timedelta(days=5)
         end_date = tx_date + timedelta(days=5)
 
@@ -128,7 +123,7 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
         if hist.empty or 'Close' not in hist.columns:
             mcap_cache[cache_key] = (None, 'Unknown', None)
             return None, 'Unknown', None
-            
+             
         hist.index = hist.index.date
         if tx_date in hist.index:
             price = float(hist.loc[tx_date, 'Close'])
@@ -136,19 +131,19 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
             hist['diff'] = abs(pd.to_datetime(hist.index) - pd.to_datetime(tx_date))
             price = float(hist.loc[hist['diff'].idxmin(), 'Close'])
 
-        # 2. Get historical share count using built-in yfinance method (clean & scaling-safe)
+        # 2. Get share count (fast check via fast_info first to save time)
         shares = None
         try:
-            shares_df = t.get_shares_full(start=str(tx_date - timedelta(days=180)), end=str(tx_date))
-            if shares_df is not None and not shares_df.empty:
-                shares = float(shares_df.iloc[-1])
+            shares = float(t.fast_info.shares) if t.fast_info.shares else None
         except Exception:
             pass
 
-        # 3. Fallback to fast_info if historical share series isn't available
+        # 3. Fallback to historical shares series if fast_info is unavailable
         if not shares or shares <= 0:
             try:
-                shares = float(t.fast_info.shares) if t.fast_info.shares else None
+                shares_df = t.get_shares_full(start=str(tx_date - timedelta(days=180)), end=str(tx_date))
+                if shares_df is not None and not shares_df.empty:
+                    shares = float(shares_df.iloc[-1])
             except Exception:
                 pass
 
@@ -207,7 +202,6 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # Ensure all columns exist in Supabase
     for stmt in [
         "ALTER TABLE insider_trades ALTER COLUMN market_cap TYPE NUMERIC;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap NUMERIC;",
@@ -231,7 +225,7 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
     skipped_count = 0
     for entry in filtered_entries:
         txt_url = f"https://www.sec.gov/Archives/{entry['filename']}"
-        time.sleep(0.05) # Faster polling
+        time.sleep(0.02)  # Slightly reduced sleep for faster throughput
          
         try:
             res = requests.get(txt_url, headers=HEADERS, timeout=8)
@@ -249,11 +243,12 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
             ticker = "NONE"
             for tag in [".//issuerTradingSymbol", ".//tradingSymbol", ".//symbol"]:
                 found = root.findtext(tag)
-                if found and found.strip() and found.strip().upper() not in ["NONE", "N/A", "NULL", ""]:
-                    ticker = found.strip().upper()
+                cleaned_found = clean_ticker_for_yf(found)
+                if cleaned_found and cleaned_found.isalpha() and len(cleaned_found) <= 5:
+                    ticker = cleaned_found
                     break
              
-            # Filter out NONE/placeholder tickers and mutual funds (5-letter tickers ending in X)
+            # Filter out mutual funds (5-letter tickers ending in X) and placeholders
             if not ticker or ticker in ['NONE', '[NONE]', 'UNKNOWN', 'N/A'] or (len(ticker) == 5 and ticker.endswith('X')):
                 skipped_count += 1
                 continue
@@ -284,8 +279,7 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
                          
                     owned_str = tx.findtext(".//sharesOwnedFollowingTransaction/value")
                     owned = float(owned_str) if owned_str else 0.0
-                    
-                    # Compute point-in-time market cap (cached for speed)
+                     
                     mcap, category, benchmark = get_point_in_time_metadata(ticker, tx_date)
                      
                     try:
