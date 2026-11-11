@@ -8,7 +8,8 @@ import xml.etree.ElementTree as ET
 import yfinance as yf
 import pandas as pd
 
-HEADERS = {'User-Agent': 'InsiderTradingApp admin@example.com'}
+# Use a valid contact email format required by SEC EDGAR fair-access policy
+HEADERS = {'User-Agent': 'InsiderTradingApp your_name@example.com'}
 SUPABASE_URL = os.environ.get("SUPABASE_DB_URL")
 
 
@@ -76,7 +77,6 @@ TICKER_ALIASES = {
 
 def clean_ticker_for_yf(ticker):
     if not ticker: return ""
-    # Strip quotes, parentheses, brackets, spaces, and exchange prefixes
     clean = str(ticker).strip().upper()
     clean = clean.replace('"', '').replace("'", "").replace('(', '').replace(')', '').replace('[', '').replace(']', '')
     if ":" in clean: clean = clean.split(":")[-1].strip()
@@ -97,17 +97,17 @@ def assign_market_cap_tier(market_cap_val):
         return 'Large', 'SPY'
 
 
-# In-memory run cache
+# In-memory run cache (keyed with exact transaction date to prevent cross-month reuse bugs)
 mcap_cache = {}
 
 def get_point_in_time_metadata(ticker_symbol, tx_date_str):
     cleaned_ticker = clean_ticker_for_yf(ticker_symbol)
     
-    # Reject invalid/non-alphabetic ticker symbols immediately (e.g. pure numbers like '1314152')
-    if not cleaned_ticker or not cleaned_ticker.isalpha() or len(cleaned_ticker) > 5:
+    # Allow alphabetic chars, dots, and hyphens (e.g. BRK-B, BF.B)
+    if not cleaned_ticker or not re.match(r'^[A-Z\-\.]{1,6}$', cleaned_ticker):
         return None, 'Unknown', None
 
-    cache_key = f"{cleaned_ticker}_{tx_date_str[:7]}"
+    cache_key = f"{cleaned_ticker}_{tx_date_str}"
     if cache_key in mcap_cache:
         return mcap_cache[cache_key]
 
@@ -131,19 +131,19 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
             hist['diff'] = abs(pd.to_datetime(hist.index) - pd.to_datetime(tx_date))
             price = float(hist.loc[hist['diff'].idxmin(), 'Close'])
 
-        # 2. Get share count (fast check via fast_info first to save time)
+        # 2. Prefer historical share count first to prevent look-ahead bias
         shares = None
         try:
-            shares = float(t.fast_info['shares']) if 'shares' in t.fast_info else None
+            shares_df = t.get_shares_full(start=str(tx_date - timedelta(days=180)), end=str(tx_date))
+            if shares_df is not None and not shares_df.empty:
+                shares = float(shares_df.iloc[-1])
         except Exception:
             pass
 
-        # 3. Fallback to historical shares series if fast_info is unavailable
+        # 3. Fallback to fast_info only if historical share series is completely unavailable
         if not shares or shares <= 0:
             try:
-                shares_df = t.get_shares_full(start=str(tx_date - timedelta(days=180)), end=str(tx_date))
-                if shares_df is not None and not shares_df.empty:
-                    shares = float(shares_df.iloc[-1])
+                shares = float(t.fast_info['shares']) if 'shares' in t.fast_info else None
             except Exception:
                 pass
 
@@ -178,7 +178,8 @@ def fetch_quarterly_index(year, quarter):
             continue
         if data_started and line.strip():
             parts = line.split('|')
-            if len(parts) == 5 and parts[2] == '4':
+            # Check for Form 4 or Form 4/A (Amendments)
+            if len(parts) == 5 and parts[2] in ('4', '4/A'):
                 form4_entries.append({
                     'cik': parts[0],
                     'company': parts[1],
@@ -206,7 +207,8 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
         "ALTER TABLE insider_trades ALTER COLUMN market_cap TYPE NUMERIC;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap NUMERIC;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap_category TEXT;",
-        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS benchmark_ticker TEXT;"
+        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS benchmark_ticker TEXT;",
+        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS is_10b51 BOOLEAN;"
     ]:
         try: cursor.execute(stmt); conn.commit()
         except Exception: pass
@@ -215,9 +217,9 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
         INSERT INTO insider_trades (
             transaction_date, ticker, sector, insider_name, insider_title, 
             shares_bought, shares_owned_following, est_value, activity_type,
-            market_cap, market_cap_category, benchmark_ticker
+            market_cap, market_cap_category, benchmark_ticker, is_10b51
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT DO NOTHING;
     """
      
@@ -225,7 +227,7 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
     skipped_count = 0
     for entry in filtered_entries:
         txt_url = f"https://www.sec.gov/Archives/{entry['filename']}"
-        time.sleep(0.02)  # Slightly reduced sleep for faster throughput
+        time.sleep(0.12)  # Respect SEC fair-access guidelines (~8-9 requests/sec max)
          
         try:
             res = requests.get(txt_url, headers=HEADERS, timeout=8)
@@ -244,7 +246,7 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
             for tag in [".//issuerTradingSymbol", ".//tradingSymbol", ".//symbol"]:
                 found = root.findtext(tag)
                 cleaned_found = clean_ticker_for_yf(found)
-                if cleaned_found and cleaned_found.isalpha() and len(cleaned_found) <= 5:
+                if cleaned_found and re.match(r'^[A-Z\-\.]{1,6}$', cleaned_found):
                     ticker = cleaned_found
                     break
              
@@ -254,44 +256,59 @@ def parse_and_insert_range(start_date_str, end_date_str, min_value=50000):
                 continue
 
             company_name = entry.get('company', '')
-            insider = root.findtext(".//rptOwnerName") or "UNKNOWN"
-            title = root.findtext(".//officerTitle") or "Director/Other"
             sector = get_sector_for_ticker(ticker, company_name)
              
-            for tx in root.findall(".//nonDerivativeTransaction"):
-                code = tx.findtext(".//transactionCoding/transactionCode")
-                acquired = tx.findtext(".//transactionAmounts/transactionAcquiredDisposedCode/value")
+            # Loop through all reporting owners on the filing (handles joint/multiple owners)
+            owners = root.findall(".//reportingOwner")
+            if not owners:
+                owners = [root] # Fallback if structure varies
+
+            for owner in owners:
+                insider = owner.findtext(".//rptOwnerName") or "UNKNOWN"
+                title = owner.findtext(".//officerTitle") or "Director/Other"
                  
-                if code == 'P' and acquired == 'A':
-                    tx_date = tx.findtext(".//transactionDate/value")
-                    if not tx_date:
-                        continue
-                         
-                    shares_str = tx.findtext(".//transactionShares/value")
-                    shares = float(shares_str) if shares_str else 0.0
-                    
-                    price_str = tx.findtext(".//transactionPricePerShare/value")
-                    price = float(price_str) if price_str else 0.0
-                    
-                    est_val = shares * price
-                    if est_val < min_value:
-                        continue
-                         
-                    owned_str = tx.findtext(".//sharesOwnedFollowingTransaction/value")
-                    owned = float(owned_str) if owned_str else 0.0
+                for tx in root.findall(".//nonDerivativeTransaction"):
+                    code = tx.findtext(".//transactionCoding/transactionCode")
+                    acquired = tx.findtext(".//transactionAmounts/transactionAcquiredDisposedCode/value")
                      
-                    mcap, category, benchmark = get_point_in_time_metadata(ticker, tx_date)
-                     
-                    try:
-                        cursor.execute(insert_query, (
-                            tx_date, ticker, sector, insider, title, shares, owned, est_val, "BUY",
-                            float(mcap) if mcap else None, category, benchmark
-                        ))
-                        conn.commit()
-                        inserted_count += 1
-                    except Exception as db_err:
-                        conn.rollback()
-                        print(f"DB Insert Error: {db_err}")
+                    if code == 'P' and acquired == 'A':
+                        tx_date = tx.findtext(".//transactionDate/value")
+                        if not tx_date:
+                            continue
+                             
+                        shares_str = tx.findtext(".//transactionShares/value")
+                        shares = float(shares_str) if shares_str else 0.0
+                        
+                        price_str = tx.findtext(".//transactionPricePerShare/value")
+                        price = float(price_str) if price_str else 0.0
+                        
+                        est_val = shares * price
+                        if est_val < min_value:
+                            continue
+                             
+                        owned_str = tx.findtext(".//sharesOwnedFollowingTransaction/value")
+                        owned = float(owned_str) if owned_str else 0.0
+
+                        # Check if executed under a Rule 10b5-1 trading plan
+                        is_10b51_val = tx.findtext(".//timelyFilingIndicator") or root.findtext(".//remarks")
+                        # Some filings use explicit 10b5-1 tags or text markers
+                        is_10b51 = False
+                        remark_text = (root.findtext(".//remarks") or "").upper()
+                        if "10B5-1" in remark_text or "10B51" in remark_text:
+                            is_10b51 = True
+                         
+                        mcap, category, benchmark = get_point_in_time_metadata(ticker, tx_date)
+                         
+                        try:
+                            cursor.execute(insert_query, (
+                                tx_date, ticker, sector, insider, title, shares, owned, est_val, "BUY",
+                                float(mcap) if mcap else None, category, benchmark, is_10b51
+                            ))
+                            conn.commit()
+                            inserted_count += 1
+                        except Exception as db_err:
+                            conn.rollback()
+                            print(f"DB Insert Error: {db_err}")
                          
         except Exception:
             continue
