@@ -286,7 +286,7 @@ def run_market_wide_etl(start_date=None, end_date=None):
                 market_cap, market_cap_category, benchmark_ticker, activity_type, accession_number
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT ON CONSTRAINT insider_trades_unique_tx_idx 
+            ON CONFLICT (accession_number, transaction_date, ticker, shares_bought) 
             DO UPDATE SET 
                 shares_owned_following = EXCLUDED.shares_owned_following,
                 price_at_tx = EXCLUDED.price_at_tx,
