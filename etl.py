@@ -147,7 +147,6 @@ def run_market_wide_etl(start_date=None, end_date=None):
     conn.autocommit = True
     cursor = conn.cursor()
 
-    # 1. Base table setup
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS insider_trades (
             id SERIAL PRIMARY KEY,
@@ -166,9 +165,7 @@ def run_market_wide_etl(start_date=None, end_date=None):
         );
     """)
     
-    # 2. Schema upgrades and cleanup of legacy single-column accession unique constraint
     alter_statements = [
-        "ALTER TABLE insider_trades DROP CONSTRAINT IF EXISTS insider_trades_accession_number_key;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS accession_number TEXT;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS price_at_tx NUMERIC(15,2);",
         "ALTER TABLE insider_trades ALTER COLUMN market_cap TYPE NUMERIC;",
@@ -185,15 +182,6 @@ def run_market_wide_etl(start_date=None, end_date=None):
             cursor.execute(stmt)
         except Exception:
             pass
-
-    # 3. Create composite unique index to support multi-line filings (direct & indirect buys per accession)
-    try:
-        cursor.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS insider_trades_unique_tx_idx 
-            ON insider_trades (accession_number, transaction_date, ticker, shares_bought);
-        """)
-    except Exception:
-        pass
 
     for filing in filings:
         try:
@@ -289,20 +277,15 @@ def run_market_wide_etl(start_date=None, end_date=None):
                 market_cap, market_cap_category, benchmark_ticker, activity_type, accession_number
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (accession_number, transaction_date, ticker, shares_bought) 
+            ON CONFLICT (transaction_date, ticker, insider_name, shares_bought, est_value) 
             DO UPDATE SET 
-                transaction_date = EXCLUDED.transaction_date,
-                ticker = EXCLUDED.ticker,
-                sector = EXCLUDED.sector, 
-                insider_name = EXCLUDED.insider_name,
-                insider_title = EXCLUDED.insider_title,
-                shares_bought = EXCLUDED.shares_bought,
                 shares_owned_following = EXCLUDED.shares_owned_following,
                 price_at_tx = EXCLUDED.price_at_tx,
                 est_value = EXCLUDED.est_value,
                 market_cap = EXCLUDED.market_cap,
                 market_cap_category = EXCLUDED.market_cap_category,
-                benchmark_ticker = EXCLUDED.benchmark_ticker;
+                benchmark_ticker = EXCLUDED.benchmark_ticker,
+                accession_number = EXCLUDED.accession_number;
         """, (
             row["transaction_date"], row["ticker"], row["sector"], row["insider_name"], row["insider_title"],
             row["shares_bought"], row["shares_owned_following"], row["price_at_tx"], row["est_value"],
