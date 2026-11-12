@@ -183,15 +183,6 @@ def run_market_wide_etl(start_date=None, end_date=None):
         except Exception:
             pass
 
-    # Ensure composite unique index exists for multi-line Form 4 parsing
-    try:
-        cursor.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS insider_trades_unique_tx_idx 
-            ON insider_trades (accession_number, transaction_date, ticker, shares_bought);
-        """)
-    except Exception:
-        pass
-
     for filing in filings:
         try:
             xml_content = filing.xml()
@@ -286,7 +277,7 @@ def run_market_wide_etl(start_date=None, end_date=None):
                 market_cap, market_cap_category, benchmark_ticker, activity_type, accession_number
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (accession_number, transaction_date, ticker, shares_bought) 
+            ON CONFLICT (transaction_date, ticker, insider_name, shares_bought, est_value) 
             DO UPDATE SET 
                 shares_owned_following = EXCLUDED.shares_owned_following,
                 price_at_tx = EXCLUDED.price_at_tx,
@@ -295,8 +286,8 @@ def run_market_wide_etl(start_date=None, end_date=None):
                 market_cap_category = EXCLUDED.market_cap_category,
                 benchmark_ticker = EXCLUDED.benchmark_ticker,
                 sector = EXCLUDED.sector,
-                insider_name = EXCLUDED.insider_name,
-                insider_title = EXCLUDED.insider_title;
+                insider_title = EXCLUDED.insider_title,
+                accession_number = EXCLUDED.accession_number;
         """, (
             row["transaction_date"], row["ticker"], row["sector"], row["insider_name"], row["insider_title"],
             row["shares_bought"], row["shares_owned_following"], row["price_at_tx"], row["est_value"],
