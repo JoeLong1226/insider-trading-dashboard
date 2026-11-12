@@ -1,7 +1,7 @@
 import os
 import datetime
 import pandas as pd
-from edgar import get_filings, get_current_filings, set_identity
+from edgar import get_filings, set_identity
 import yfinance as yf
 import psycopg2
 
@@ -114,44 +114,21 @@ def get_ticker_metadata(ticker_symbol):
         return None, 'Micro/Small', 'IWM'
 
 def run_market_wide_etl(start_date=None, end_date=None):
-    filings_list = []
-
-    print("Fetching live real-time filings for today...")
-    try:
-        live_filings = get_current_filings()
-        filtered_live = live_filings.filter(form=["4", "4/A"])
-        if filtered_live:
-            filings_list.extend(list(filtered_live))
-    except Exception as e:
-        print(f"Notice: Live current filings fetch note: {e}")
-
+    today_str = datetime.date.today().strftime('%Y-%m-%d')
     if start_date and end_date:
         date_query = f"{start_date}:{end_date}"
         print(f"Fetching Form 4 & 4/A filings for date range: {date_query}...")
     elif start_date:
-        date_query = f"{start_date}:"
-        print(f"Fetching Form 4 & 4/A filings from {start_date} onwards...")
+        date_query = f"{start_date}:{today_str}"
+        print(f"Fetching Form 4 & 4/A filings from {start_date} to {today_str}...")
     else:
         start_date = (datetime.date.today() - datetime.timedelta(days=10)).strftime('%Y-%m-%d')
-        date_query = f"{start_date}:"
-        print(f"Fetching recent Form 4 & 4/A filings from {start_date} onwards...")
+        date_query = f"{start_date}:{today_str}"
+        print(f"Fetching recent Form 4 & 4/A filings from {start_date} to {today_str}...")
 
-    hist_filings = get_filings(form=["4", "4/A"], filing_date=date_query)
-    if hist_filings:
-        filings_list.extend(list(hist_filings))
-
-    seen_accessions = set()
-    filings = []
-    for f in filings_list:
-        acc = getattr(f, 'accession_number', None)
-        if acc:
-            if acc not in seen_accessions:
-                seen_accessions.add(acc)
-                filings.append(f)
-        else:
-            filings.append(f)
-
-    print(f"Total unique filings to process: {len(filings)}")
+    filings = get_filings(form=["4", "4/A"], filing_date=date_query)
+    print(f"Total filings retrieved to process: {len(filings) if filings else 0}")
+    
     parsed_transactions = []
 
     conn_url = os.environ.get("SUPABASE_DB_URL")
