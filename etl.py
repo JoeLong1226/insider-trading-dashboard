@@ -3,7 +3,7 @@ import re
 import datetime
 import xml.etree.ElementTree as ET
 import pandas as pd
-from edgar import get_filings, set_identity
+from edgar import get_filings, get_current_filings, set_identity
 import yfinance as yf
 import psycopg2
 
@@ -128,6 +128,19 @@ def get_ticker_metadata(ticker_symbol):
         return None, 'Micro/Small', 'IWM'
 
 def run_market_wide_etl(start_date=None, end_date=None):
+    filings_list = []
+
+    # 1. Fetch live real-time filings for today (OpenInsider style)
+    print("Fetching live real-time filings for today...")
+    try:
+        live_filings = get_current_filings()
+        filtered_live = live_filings.filter(form=["4", "4/A"])
+        if filtered_live:
+            filings_list.extend(list(filtered_live))
+    except Exception as e:
+        print(f"Notice: Could not fetch live current filings ({e}), relying on historical date query.")
+
+    # 2. Fetch historical/date-range filings to catch any backlog or late-filers
     if start_date and end_date:
         date_query = f"{start_date}:{end_date}"
         print(f"Fetching Form 4 & 4/A filings for date range: {date_query}...")
@@ -137,9 +150,25 @@ def run_market_wide_etl(start_date=None, end_date=None):
     else:
         start_date = (datetime.date.today() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')
         date_query = f"{start_date}:"
-        print(f"Fetching recent Form 4 & 4/A filings from {start_date}...")
+        print(f"Fetching recent Form 4 & 4/A filings from {start_date} onwards...")
 
-    filings = get_filings(form=["4", "4/A"], filing_date=date_query)
+    hist_filings = get_filings(form=["4", "4/A"], filing_date=date_query)
+    if hist_filings:
+        filings_list.extend(list(hist_filings))
+
+    # Deduplicate filings based on accession number if available
+    seen_accessions = set()
+    filings = []
+    for f in filings_list:
+        acc = getattr(f, 'accession_number', None)
+        if acc:
+            if acc not in seen_accessions:
+                seen_accessions.add(acc)
+                filings.append(f)
+        else:
+            filings.append(f)
+
+    print(f"Total unique filings to process: {len(filings)}")
     parsed_transactions = []
 
     conn_url = os.environ.get("SUPABASE_DB_URL")
@@ -183,7 +212,7 @@ def run_market_wide_etl(start_date=None, end_date=None):
         except Exception:
             pass
 
-    # Drop old conflicting constraint if it exists, and create the correct composite unique index
+    # Clean up old legacy constraints and ensure the correct unique index exists
     try:
         cursor.execute("ALTER TABLE insider_trades DROP CONSTRAINT IF EXISTS unique_trade;")
         cursor.execute("DROP INDEX IF EXISTS unique_trade;")
@@ -206,7 +235,7 @@ def run_market_wide_etl(start_date=None, end_date=None):
 
             accession_number = getattr(filing, 'accession_number', None) or root.findtext(".//accessionNumber", "")
             if not accession_number:
-                accession_number = str(filing.filing_date) + "_" + root.findtext(".//issuer/issuerCik", "")
+                accession_number = str(getattr(filing, 'filing_date', datetime.date.today())) + "_" + root.findtext(".//issuer/issuerCik", "")
 
             raw_ticker = root.findtext(".//issuer/issuerTradingSymbol", "").strip().upper()
             issuer_name = root.findtext(".//issuer/issuerName", "").strip()
@@ -251,7 +280,8 @@ def run_market_wide_etl(start_date=None, end_date=None):
                     price = 0.0
 
                 shares_following = safe_bigint(shares_following_raw) or 0
-                tx_date = tx.findtext(".//transactionDate/value", str(filing.filing_date))
+                fallback_date = str(getattr(filing, 'filing_date', datetime.date.today()))
+                tx_date = tx.findtext(".//transactionDate/value", fallback_date)
 
                 est_val = round(shares * price, 2)
 
