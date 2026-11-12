@@ -183,7 +183,13 @@ def run_market_wide_etl(start_date=None, end_date=None):
         except Exception:
             pass
 
-    # Ensure composite unique index exists for multi-line Form 4 parsing
+    # Drop old conflicting constraint if it exists, and create the correct composite unique index
+    try:
+        cursor.execute("ALTER TABLE insider_trades DROP CONSTRAINT IF EXISTS unique_trade;")
+        cursor.execute("DROP INDEX IF EXISTS unique_trade;")
+    except Exception:
+        pass
+
     try:
         cursor.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS insider_trades_unique_tx_idx 
