@@ -140,7 +140,6 @@ def run_market_wide_etl(start_date=None, end_date=None):
     if hist_filings:
         filings_list.extend(list(hist_filings))
 
-    # Deduplicate filings by accession number
     seen_accessions = set()
     filings = []
     for f in filings_list:
@@ -211,7 +210,6 @@ def run_market_wide_etl(start_date=None, end_date=None):
 
     for filing in filings:
         try:
-            # Use edgartools native object parser instead of manual XML string parsing
             ownership = filing.obj()
             if not ownership: continue
 
@@ -234,13 +232,11 @@ def run_market_wide_etl(start_date=None, end_date=None):
             if not title:
                 title = "Insider"
 
-            # Get structured non-derivative transactions table directly from edgartools
             tx_df = ownership.non_derivative_transaction_values
             if tx_df is None or tx_df.empty:
                 continue
 
             for _, tx in tx_df.iterrows():
-                # Filter strictly for Purchases (Code 'P')
                 tx_code = str(tx.get('transactionCode', '')).strip().upper()
                 if tx_code != 'P': continue
 
@@ -277,7 +273,8 @@ def run_market_wide_etl(start_date=None, end_date=None):
                         "activity_type": "Purchase",
                         "accession_number": accession_number
                     })
-        except Exception:
+        except Exception as e:
+            print(f"Error parsing filing {getattr(filing, 'accession_number', 'Unknown')}: {e}")
             continue
 
     df_new = pd.DataFrame(parsed_transactions)
