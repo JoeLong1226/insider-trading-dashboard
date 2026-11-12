@@ -1,7 +1,5 @@
 import os
-import re
 import datetime
-import xml.etree.ElementTree as ET
 import pandas as pd
 from edgar import get_filings, get_current_filings, set_identity
 import yfinance as yf
@@ -44,21 +42,16 @@ def resolve_ticker(raw_ticker, issuer_name, issuer_cik=""):
     if clean_cik in FUND_CIK_MAP: return FUND_CIK_MAP[clean_cik]
     if issuer_cik in FUND_CIK_MAP: return FUND_CIK_MAP[issuer_cik]
 
-    name_upper = issuer_name.upper()
+    name_upper = str(issuer_name).upper()
     if "BLUEROCK" in name_upper or "BLUROCK" in name_upper: return "BPRE"
     if "BLACKSTONE PRIVATE REAL ESTATE CREDIT" in name_upper: return "BREC"
 
-    # Fallback parsing for raw ticker
     if not raw_ticker or not isinstance(raw_ticker, str):
-        match = re.search(r'\[\s*([A-Z0-9.\-]+)\s*\]', issuer_name)
-        if match:
-            raw_ticker = match.group(1)
-        else:
-            return None
+        return None
 
     clean = str(raw_ticker).strip().upper().replace("[", "").replace("]", "")
     if clean in ["NONE", "NULL", "N/A", "UNKNOWN", "UNKNO", "BLACK", "BLACKS", "VISTA", "5C"]: return None
-    if bool(re.match(r"^[A-Z0-9.\-]+$", clean)) and len(clean) <= 6: return clean
+    if len(clean) <= 6: return clean
     return None
 
 def infer_sector_from_name(company_name):
@@ -88,16 +81,11 @@ def get_sector_for_ticker(ticker, issuer_name=""):
         stock = yf.Ticker(cleaned_ticker)
         info = stock.info
         sector = info.get("sector") or info.get("industry")
-        if sector: 
-            return sector
-        
-        quote_type = info.get("quoteType", "").upper()
-        if quote_type in ["ETF", "MUTUALFUND"]: 
-            return "Funds & ETFs"
-        
-        return infer_sector_from_name(issuer_name)
+        if sector: return sector
+        if info.get("quoteType", "").upper() in ["ETF", "MUTUALFUND"]: return "Funds & ETFs"
     except Exception:
-        return infer_sector_from_name(issuer_name)
+        pass
+    return infer_sector_from_name(issuer_name)
 
 def assign_market_cap_tier(market_cap_val):
     if not market_cap_val or market_cap_val <= 0:
@@ -118,10 +106,8 @@ def get_ticker_metadata(ticker_symbol):
         mcap = None
         if hasattr(t, 'fast_info') and t.fast_info.market_cap:
             mcap = float(t.fast_info.market_cap)
-        
         if not mcap or mcap <= 0:
             return None, 'Micro/Small', 'IWM'
-            
         category, benchmark = assign_market_cap_tier(mcap)
         return mcap, category, benchmark
     except Exception:
@@ -130,7 +116,6 @@ def get_ticker_metadata(ticker_symbol):
 def run_market_wide_etl(start_date=None, end_date=None):
     filings_list = []
 
-    # 1. Fetch live real-time filings for today
     print("Fetching live real-time filings for today...")
     try:
         live_filings = get_current_filings()
@@ -138,9 +123,8 @@ def run_market_wide_etl(start_date=None, end_date=None):
         if filtered_live:
             filings_list.extend(list(filtered_live))
     except Exception as e:
-        print(f"Notice: Could not fetch live current filings ({e}), relying on historical date query.")
+        print(f"Notice: Live current filings fetch note: {e}")
 
-    # 2. Fetch historical/date-range filings (extended lookback window to 10 days to catch late filings)
     if start_date and end_date:
         date_query = f"{start_date}:{end_date}"
         print(f"Fetching Form 4 & 4/A filings for date range: {date_query}...")
@@ -156,7 +140,7 @@ def run_market_wide_etl(start_date=None, end_date=None):
     if hist_filings:
         filings_list.extend(list(hist_filings))
 
-    # Deduplicate filings based on accession number
+    # Deduplicate filings by accession number
     seen_accessions = set()
     filings = []
     for f in filings_list:
@@ -205,14 +189,12 @@ def run_market_wide_etl(start_date=None, end_date=None):
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS ret_benchmark_after NUMERIC(8,4);",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS alpha_after NUMERIC(8,4);"
     ]
-    
     for stmt in alter_statements:
         try:
             cursor.execute(stmt)
         except Exception:
             pass
 
-    # Clean up old legacy constraints and ensure the correct unique index exists
     try:
         cursor.execute("ALTER TABLE insider_trades DROP CONSTRAINT IF EXISTS unique_trade;")
         cursor.execute("DROP INDEX IF EXISTS unique_trade;")
@@ -229,59 +211,49 @@ def run_market_wide_etl(start_date=None, end_date=None):
 
     for filing in filings:
         try:
-            xml_content = filing.xml()
-            if not xml_content: continue
-            root = ET.fromstring(xml_content)
+            # Use edgartools native object parser instead of manual XML string parsing
+            ownership = filing.obj()
+            if not ownership: continue
 
-            accession_number = getattr(filing, 'accession_number', None) or root.findtext(".//accessionNumber", "")
+            accession_number = getattr(filing, 'accession_number', None) or getattr(ownership, 'accession_number', '')
+            filing_date_str = str(getattr(filing, 'filing_date', datetime.date.today()))
             if not accession_number:
-                accession_number = str(getattr(filing, 'filing_date', datetime.date.today())) + "_" + root.findtext(".//issuer/issuerCik", "")
+                accession_number = filing_date_str + "_" + str(getattr(ownership, 'cik', ''))
 
-            raw_ticker = root.findtext(".//issuer/issuerTradingSymbol", "").strip().upper()
-            issuer_name = root.findtext(".//issuer/issuerName", "").strip()
-            issuer_cik = root.findtext(".//issuer/issuerCik", "").strip()
+            issuer = getattr(ownership, 'issuer', None)
+            raw_ticker = getattr(issuer, 'trading_symbol', '') if issuer else ''
+            issuer_name = getattr(issuer, 'issuer_name', '') if issuer else ''
+            issuer_cik = getattr(issuer, 'cik', '') if issuer else ''
 
             ticker = resolve_ticker(raw_ticker, issuer_name, issuer_cik)
             if not ticker: continue
 
-            insider = root.findtext(".//reportingOwner/reportingOwnerId/rptOwnerName", "Insider Trader")
-            
-            rel = root.find(".//reportingOwner/reportingOwnerRelationship")
-            title = ""
-            if rel is not None:
-                title = rel.findtext("officerTitle", "").strip()
-                if not title:
-                    is_dir = rel.findtext("isDirector", "0") == "1"
-                    is_off = rel.findtext("isOfficer", "0") == "1"
-                    is_10 = rel.findtext("isTenPercentOwner", "0") == "1"
-                    
-                    roles = []
-                    if is_dir: roles.append("Director")
-                    if is_off: roles.append("Officer")
-                    if is_10: roles.append("10% Owner")
-                    title = ", ".join(roles) if roles else "Insider"
+            owner = getattr(ownership, 'reporting_owner', None)
+            insider = getattr(owner, 'rpt_owner_name', 'Insider Trader') if owner else 'Insider Trader'
+            title = getattr(owner, 'officer_title', '') if owner else ''
             if not title:
                 title = "Insider"
 
-            for tx in root.findall(".//nonDerivativeTransaction"):
-                code_elem = tx.find(".//transactionCoding/transactionCode")
-                if code_elem is None or code_elem.text != "P": continue
+            # Get structured non-derivative transactions table directly from edgartools
+            tx_df = ownership.non_derivative_transaction_values
+            if tx_df is None or tx_df.empty:
+                continue
 
-                shares_raw = tx.findtext(".//transactionAmounts/transactionShares/value", "0")
-                price_raw = tx.findtext(".//transactionAmounts/transactionPricePerShare/value", "0")
-                shares_following_raw = tx.findtext(".//postTransactionAmounts/sharesOwnedFollowingTransaction/value", "0")
+            for _, tx in tx_df.iterrows():
+                # Filter strictly for Purchases (Code 'P')
+                tx_code = str(tx.get('transactionCode', '')).strip().upper()
+                if tx_code != 'P': continue
 
-                shares = safe_bigint(shares_raw)
+                shares = safe_bigint(tx.get('shares', 0))
                 if not shares or shares <= 0: continue
 
                 try:
-                    price = round(float(price_raw), 2)
+                    price = round(float(tx.get('pricePerShare', 0.0)), 2)
                 except Exception:
                     price = 0.0
 
-                shares_following = safe_bigint(shares_following_raw) or 0
-                fallback_date = str(getattr(filing, 'filing_date', datetime.date.today()))
-                tx_date = tx.findtext(".//transactionDate/value", fallback_date)
+                shares_following = safe_bigint(tx.get('sharesOwnedFollowing', 0)) or 0
+                tx_date = str(tx.get('transactionDate', filing_date_str))
 
                 est_val = round(shares * price, 2)
 
@@ -305,7 +277,7 @@ def run_market_wide_etl(start_date=None, end_date=None):
                         "activity_type": "Purchase",
                         "accession_number": accession_number
                     })
-        except Exception as e:
+        except Exception:
             continue
 
     df_new = pd.DataFrame(parsed_transactions)
