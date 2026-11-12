@@ -130,7 +130,7 @@ def get_ticker_metadata(ticker_symbol):
 def run_market_wide_etl(start_date=None, end_date=None):
     filings_list = []
 
-    # 1. Fetch live real-time filings for today (OpenInsider style)
+    # 1. Fetch live real-time filings for today
     print("Fetching live real-time filings for today...")
     try:
         live_filings = get_current_filings()
@@ -140,7 +140,7 @@ def run_market_wide_etl(start_date=None, end_date=None):
     except Exception as e:
         print(f"Notice: Could not fetch live current filings ({e}), relying on historical date query.")
 
-    # 2. Fetch historical/date-range filings to catch any backlog or late-filers
+    # 2. Fetch historical/date-range filings (extended lookback window to 10 days to catch late filings)
     if start_date and end_date:
         date_query = f"{start_date}:{end_date}"
         print(f"Fetching Form 4 & 4/A filings for date range: {date_query}...")
@@ -148,7 +148,7 @@ def run_market_wide_etl(start_date=None, end_date=None):
         date_query = f"{start_date}:"
         print(f"Fetching Form 4 & 4/A filings from {start_date} onwards...")
     else:
-        start_date = (datetime.date.today() - datetime.timedelta(days=7)).strftime('%Y-%m-%d')
+        start_date = (datetime.date.today() - datetime.timedelta(days=10)).strftime('%Y-%m-%d')
         date_query = f"{start_date}:"
         print(f"Fetching recent Form 4 & 4/A filings from {start_date} onwards...")
 
@@ -156,7 +156,7 @@ def run_market_wide_etl(start_date=None, end_date=None):
     if hist_filings:
         filings_list.extend(list(hist_filings))
 
-    # Deduplicate filings based on accession number if available
+    # Deduplicate filings based on accession number
     seen_accessions = set()
     filings = []
     for f in filings_list:
@@ -305,7 +305,7 @@ def run_market_wide_etl(start_date=None, end_date=None):
                         "activity_type": "Purchase",
                         "accession_number": accession_number
                     })
-        except Exception:
+        except Exception as e:
             continue
 
     df_new = pd.DataFrame(parsed_transactions)
