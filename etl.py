@@ -50,7 +50,6 @@ def resolve_ticker(raw_ticker, issuer_name, issuer_cik=""):
 
     # Fallback parsing for raw ticker
     if not raw_ticker or not isinstance(raw_ticker, str):
-        # Try extracting ticker from issuer name brackets if raw_ticker is empty (e.g. [ STLN ])
         match = re.search(r'\[\s*([A-Z0-9.\-]+)\s*\]', issuer_name)
         if match:
             raw_ticker = match.group(1)
@@ -102,7 +101,7 @@ def get_sector_for_ticker(ticker, issuer_name=""):
 
 def assign_market_cap_tier(market_cap_val):
     if not market_cap_val or market_cap_val <= 0:
-        return 'Micro/Small', 'IWM' # Safe fallback for micro-cap / newly issued equities
+        return 'Micro/Small', 'IWM'
     if market_cap_val < 2_000_000_000:
         return 'Micro/Small', 'IWM'
     elif 2_000_000_000 <= market_cap_val <= 10_000_000_000:
@@ -148,6 +147,7 @@ def run_market_wide_etl(start_date=None, end_date=None):
     conn.autocommit = True
     cursor = conn.cursor()
 
+    # 1. Base table setup
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS insider_trades (
             id SERIAL PRIMARY KEY,
@@ -158,15 +158,19 @@ def run_market_wide_etl(start_date=None, end_date=None):
             insider_title TEXT,
             shares_bought BIGINT,
             shares_owned_following BIGINT,
-            est_value NUMERIC,
+            est_value NUMERIC(15,2),
+            price_at_tx NUMERIC(15,2),
             activity_type TEXT,
-            accession_number TEXT UNIQUE,
+            accession_number TEXT,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
     """)
     
+    # 2. Schema upgrades and cleanup of legacy single-column accession unique constraint
     alter_statements = [
+        "ALTER TABLE insider_trades DROP CONSTRAINT IF EXISTS insider_trades_accession_number_key;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS accession_number TEXT;",
+        "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS price_at_tx NUMERIC(15,2);",
         "ALTER TABLE insider_trades ALTER COLUMN market_cap TYPE NUMERIC;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap NUMERIC;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS market_cap_category TEXT;",
@@ -181,6 +185,15 @@ def run_market_wide_etl(start_date=None, end_date=None):
             cursor.execute(stmt)
         except Exception:
             pass
+
+    # 3. Create composite unique index to support multi-line filings (direct & indirect buys per accession)
+    try:
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS insider_trades_unique_tx_idx 
+            ON insider_trades (accession_number, transaction_date, ticker, shares_bought);
+        """)
+    except Exception:
+        pass
 
     for filing in filings:
         try:
@@ -230,14 +243,14 @@ def run_market_wide_etl(start_date=None, end_date=None):
                 if not shares or shares <= 0: continue
 
                 try:
-                    price = float(price_raw)
+                    price = round(float(price_raw), 2)
                 except Exception:
                     price = 0.0
 
                 shares_following = safe_bigint(shares_following_raw) or 0
                 tx_date = tx.findtext(".//transactionDate/value", str(filing.filing_date))
 
-                est_val = shares * price
+                est_val = round(shares * price, 2)
 
                 if est_val >= 50000:
                     sector = get_sector_for_ticker(ticker, issuer_name)
@@ -251,6 +264,7 @@ def run_market_wide_etl(start_date=None, end_date=None):
                         "insider_title": title,
                         "shares_bought": shares, 
                         "shares_owned_following": shares_following,
+                        "price_at_tx": price,
                         "est_value": float(est_val), 
                         "market_cap": float(mcap) if mcap else None,
                         "market_cap_category": mcap_category,
@@ -271,11 +285,11 @@ def run_market_wide_etl(start_date=None, end_date=None):
         cursor.execute("""
             INSERT INTO insider_trades (
                 transaction_date, ticker, sector, insider_name, insider_title, 
-                shares_bought, shares_owned_following, est_value, 
+                shares_bought, shares_owned_following, price_at_tx, est_value, 
                 market_cap, market_cap_category, benchmark_ticker, activity_type, accession_number
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (accession_number) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (accession_number, transaction_date, ticker, shares_bought) 
             DO UPDATE SET 
                 transaction_date = EXCLUDED.transaction_date,
                 ticker = EXCLUDED.ticker,
@@ -284,13 +298,14 @@ def run_market_wide_etl(start_date=None, end_date=None):
                 insider_title = EXCLUDED.insider_title,
                 shares_bought = EXCLUDED.shares_bought,
                 shares_owned_following = EXCLUDED.shares_owned_following,
+                price_at_tx = EXCLUDED.price_at_tx,
                 est_value = EXCLUDED.est_value,
                 market_cap = EXCLUDED.market_cap,
                 market_cap_category = EXCLUDED.market_cap_category,
                 benchmark_ticker = EXCLUDED.benchmark_ticker;
         """, (
             row["transaction_date"], row["ticker"], row["sector"], row["insider_name"], row["insider_title"],
-            row["shares_bought"], row["shares_owned_following"], row["est_value"],
+            row["shares_bought"], row["shares_owned_following"], row["price_at_tx"], row["est_value"],
             row["market_cap"], row["market_cap_category"], row["benchmark_ticker"], row["activity_type"], row["accession_number"]
         ))
 
