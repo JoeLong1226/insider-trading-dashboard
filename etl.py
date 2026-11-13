@@ -128,11 +128,11 @@ def run_market_wide_etl(start_date=None, end_date=None):
 
     filings = get_filings(form=["4", "4/A"], filing_date=date_query)
     print(f"Total filings retrieved to process: {len(filings) if filings else 0}")
-
-    print(f"DEBUG: Retrieved {len(filings) if filings else 0} filings for query '{date_query}'")
-if filings and len(filings) > 0:
-    print(f"DEBUG: First filing date: {getattr(filings[0], 'filing_date', 'Unknown')}, accession: {getattr(filings[0], 'accession_number', 'Unknown')}")
     
+    print(f"DEBUG: Retrieved {len(filings) if filings else 0} filings for query '{date_query}'")
+    if filings and len(filings) > 0:
+        print(f"DEBUG: First filing date: {getattr(filings[0], 'filing_date', 'Unknown')}, accession: {getattr(filings[0], 'accession_number', 'Unknown')}")
+     
     parsed_transactions = []
 
     conn_url = os.environ.get("SUPABASE_DB_URL")
@@ -207,7 +207,7 @@ if filings and len(filings) > 0:
             ticker = resolve_ticker(raw_ticker, issuer_name, issuer_cik)
             if not ticker: continue
 
-            # Robust handling for reporting owners (can be single object or list/DataFrame in edgartools)
+            # Robust handling for reporting owners
             owner_raw = getattr(ownership, 'reporting_owner', None)
             if isinstance(owner_raw, pd.DataFrame) and not owner_raw.empty:
                 insider = str(owner_raw.iloc[0].get('rptOwnerName', owner_raw.iloc[0].get('name', 'Insider Trader')))
@@ -270,7 +270,9 @@ if filings and len(filings) > 0:
     df_new = pd.DataFrame(parsed_transactions)
     if df_new.empty:
         print("No valid trades found.")
-        cursor.close(); conn.close(); return
+        cursor.close()
+        conn.close()
+        return
 
     print(f"Upserting {len(df_new)} validated trades into Supabase...")
     for _, row in df_new.iterrows():
