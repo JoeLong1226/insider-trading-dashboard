@@ -75,7 +75,7 @@ def infer_sector_from_name(company_name):
 def get_sector_for_ticker(ticker, issuer_name=""):
     if ticker in ["BREC", "BPRE", "BCRED", "BMACX", "MXF"]: 
         return "Private Credit & Funds"
-    
+     
     cleaned_ticker = clean_ticker_for_yf(ticker)
     try:
         stock = yf.Ticker(cleaned_ticker)
@@ -128,7 +128,7 @@ def run_market_wide_etl(start_date=None, end_date=None):
 
     filings = get_filings(form=["4", "4/A"], filing_date=date_query)
     print(f"Total filings retrieved to process: {len(filings) if filings else 0}")
-    
+     
     parsed_transactions = []
 
     conn_url = os.environ.get("SUPABASE_DB_URL")
@@ -153,7 +153,7 @@ def run_market_wide_etl(start_date=None, end_date=None):
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
     """)
-    
+     
     alter_statements = [
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS accession_number TEXT;",
         "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS price_at_tx NUMERIC(15,2);",
@@ -203,11 +203,20 @@ def run_market_wide_etl(start_date=None, end_date=None):
             ticker = resolve_ticker(raw_ticker, issuer_name, issuer_cik)
             if not ticker: continue
 
-            owner = getattr(ownership, 'reporting_owner', None)
-            insider = getattr(owner, 'rpt_owner_name', 'Insider Trader') if owner else 'Insider Trader'
-            title = getattr(owner, 'officer_title', '') if owner else ''
-            if not title:
-                title = "Insider"
+            # Robust handling for reporting owners (can be single object or list/DataFrame in edgartools)
+            owner_raw = getattr(ownership, 'reporting_owner', None)
+            if isinstance(owner_raw, pd.DataFrame) and not owner_raw.empty:
+                insider = str(owner_raw.iloc[0].get('rptOwnerName', owner_raw.iloc[0].get('name', 'Insider Trader')))
+                title = str(owner_raw.iloc[0].get('officerTitle', '10% Owner'))
+            elif isinstance(owner_raw, list) and len(owner_raw) > 0:
+                insider = getattr(owner_raw[0], 'rpt_owner_name', getattr(owner_raw[0], 'name', 'Insider Trader'))
+                title = getattr(owner_raw[0], 'officer_title', '10% Owner')
+            else:
+                insider = getattr(owner_raw, 'rpt_owner_name', getattr(owner_raw, 'name', 'Insider Trader')) if owner_raw else 'Insider Trader'
+                title = getattr(owner_raw, 'officer_title', '10% Owner') if owner_raw else '10% Owner'
+
+            if not title or title.lower() == 'nan':
+                title = "10% Owner"
 
             tx_df = ownership.non_derivative_transaction_values
             if tx_df is None or tx_df.empty:
