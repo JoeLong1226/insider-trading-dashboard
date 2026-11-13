@@ -128,7 +128,11 @@ def run_market_wide_etl(start_date=None, end_date=None):
 
     filings = get_filings(form=["4", "4/A"], filing_date=date_query)
     print(f"Total filings retrieved to process: {len(filings) if filings else 0}")
-     
+
+    print(f"DEBUG: Retrieved {len(filings) if filings else 0} filings for query '{date_query}'")
+if filings and len(filings) > 0:
+    print(f"DEBUG: First filing date: {getattr(filings[0], 'filing_date', 'Unknown')}, accession: {getattr(filings[0], 'accession_number', 'Unknown')}")
+    
     parsed_transactions = []
 
     conn_url = os.environ.get("SUPABASE_DB_URL")
