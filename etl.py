@@ -140,14 +140,25 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
         return None, 'Unknown', None
 
 def fetch_live_sec_rss():
-    """Fetches real-time Form 4 filings directly from SEC EDGAR Atom feed."""
+    """Fetches real-time Form 4 filings directly from SEC EDGAR Atom feed with retry logic."""
     url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&output=atom"
+    response = None
+    
+    for attempt in range(3):
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=45)
+            if response.status_code == 200:
+                break
+            print(f"SEC RSS attempt {attempt + 1} returned status code {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"SEC RSS attempt {attempt + 1} failed ({e}); retrying...")
+            time.sleep(3)
+
+    if not response or response.status_code != 200:
+        print("Failed to fetch SEC RSS feed after 3 attempts.")
+        return []
+    
     try:
-        response = requests.get(url, headers=HEADERS, timeout=30)
-        if response.status_code != 200:
-            print(f"Failed to fetch SEC RSS feed. Status: {response.status_code}")
-            return []
-        
         root = ET.fromstring(response.content)
         ns = {'atom': 'http://www.w3.org/2005/Atom'}
         entries = []
@@ -177,7 +188,7 @@ def fetch_live_sec_rss():
                 })
         return entries
     except Exception as e:
-        print(f"Error parsing SEC RSS feed: {e}")
+        print(f"Error parsing SEC RSS XML content: {e}")
         return []
 
 def fetch_efts_search_api(target_date_str):
