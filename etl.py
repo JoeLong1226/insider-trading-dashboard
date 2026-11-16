@@ -164,16 +164,65 @@ def fetch_quarterly_index(year, quarter):
                 })
     return form4_entries
 
+def fetch_live_atom_feed(target_date_str):
+    url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=only&count=100&output=atom"
+    response = requests.get(url, headers=HEADERS, timeout=15)
+    if response.status_code != 200:
+        return []
+
+    ns = {'atom': 'http://www.w3.org/2005/Atom'}
+    root = ET.fromstring(response.text)
+    form4_entries = []
+
+    for entry in root.findall('atom:entry', ns):
+        category_el = entry.find('atom:category', ns)
+        form_type = category_el.attrib.get('term', '').strip() if category_el is not None else ''
+        if form_type not in ('4', '4/A'):
+            continue
+
+        updated_text = entry.findtext('atom:updated', default='', namespaces=ns)
+        date_filed = updated_text[:10]
+        if date_filed != target_date_str:
+            continue
+
+        link_el = entry.find('atom:link', ns)
+        href = link_el.attrib.get('href', '') if link_el is not None else ''
+        if '/Archives/' not in href or '-index.htm' not in href:
+            continue
+
+        # Convert https://www.sec.gov/Archives/edgar/data/CIK/ACC-index.htm -> edgar/data/CIK/ACC.txt
+        filename = href.split('/Archives/')[1].replace('-index.htm', '.txt').strip()
+        parts = filename.split('/')
+        cik = parts[2] if len(parts) >= 3 else ''
+
+        title_text = entry.findtext('atom:title', default='', namespaces=ns)
+        company = title_text.split(' - ', 1)[1].split(' (')[0].strip() if ' - ' in title_text else title_text
+
+        form4_entries.append({
+            'cik': cik,
+            'company': company,
+            'form_type': form_type,
+            'date_filed': date_filed,
+            'filename': filename
+        })
+
+    return form4_entries
+
 def run_daily_etl(target_date_str=None):
     if not target_date_str:
         target_date_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
 
-    target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-    qtr = (target_dt.month - 1) // 3 + 1
-    
-    print(f"Fetching QTR {qtr} index for {target_dt.year} (Target Date: {target_date_str})...")
-    all_entries = fetch_quarterly_index(target_dt.year, qtr)
-    filtered_entries = [e for e in all_entries if e['date_filed'] == target_date_str]
+    today_str = datetime.today().strftime('%Y-%m-%d')
+    if target_date_str == today_str:
+        print(f"Fetching live SEC Atom feed for today ({target_date_str})...")
+        filtered_entries = fetch_live_atom_feed(target_date_str)
+    else:
+        target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
+        qtr = (target_dt.month - 1) // 3 + 1
+        print(f"Fetching QTR {qtr} index for {target_dt.year} (Target Date: {target_date_str})...")
+        all_entries = fetch_quarterly_index(target_dt.year, qtr)
+        filtered_entries = [e for e in all_entries if e['date_filed'] == target_date_str]
+
     print(f"Found {len(filtered_entries)} Form 4 filings filed on {target_date_str}.")
 
     conn = get_db_connection()
@@ -285,7 +334,7 @@ def run_daily_etl(target_date_str=None):
 
     cursor.close()
     conn.close()
-    print(f"--- Daily ETL completed. Inserted {inserted_count} new trades. ---")
+    print(f"--- Daily ETL completed for {target_date_str}. Inserted {inserted_count} new trades. ---")
 
 if __name__ == "__main__":
     import sys
