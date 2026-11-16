@@ -164,8 +164,8 @@ def fetch_quarterly_index(year, quarter):
                 })
     return form4_entries
 
-def fetch_live_atom_feed(target_date_str):
-    url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=only&count=500&output=atom"
+def fetch_efts_search_api(target_date_str):
+    url = f"https://efts.sec.gov/LATEST/search-index?q=*&forms=4,4/A&dateRange=custom&startdt={target_date_str}&enddt={target_date_str}"
     response = None
     for attempt in range(3):
         try:
@@ -173,45 +173,44 @@ def fetch_live_atom_feed(target_date_str):
             if response.status_code == 200:
                 break
         except requests.exceptions.RequestException as e:
-            print(f"Live Atom feed attempt {attempt + 1} failed ({e}); retrying...")
+            print(f"EFTS Search API attempt {attempt + 1} failed ({e}); retrying...")
             time.sleep(2)
 
     if not response or response.status_code != 200:
-        print("Could not reach live Atom feed after 3 attempts; skipping live check.")
+        print("Could not reach EFTS Search API after 3 attempts.")
         return []
 
-    ns = {'atom': 'http://www.w3.org/2005/Atom'}
-    root = ET.fromstring(response.text)
+    data = response.json()
+    hits = data.get('hits', {}).get('hits', [])
     form4_entries = []
 
-    for entry in root.findall('atom:entry', ns):
-        category_el = entry.find('atom:category', ns)
-        form_type = category_el.attrib.get('term', '').strip() if category_el is not None else ''
+    for hit in hits:
+        src = hit.get('_source', {})
+        form_type = src.get('form', '')
         if form_type not in ('4', '4/A'):
             continue
 
-        updated_text = entry.findtext('atom:updated', default='', namespaces=ns)
-        date_filed = updated_text[:10]
-        if date_filed != target_date_str:
+        file_date = src.get('file_date', '')
+        if file_date != target_date_str:
             continue
 
-        link_el = entry.find('atom:link', ns)
-        href = link_el.attrib.get('href', '') if link_el is not None else ''
-        if '/Archives/' not in href or '-index.htm' not in href:
+        _id = hit.get('_id', '')
+        if ':' in _id:
+            filename = _id.split(':', 1)[1]
+        else:
             continue
 
-        filename = href.split('/Archives/')[1].replace('-index.htm', '.txt').strip()
-        parts = filename.split('/')
-        cik = parts[2] if len(parts) >= 3 else ''
+        ciks = src.get('ciks', [])
+        cik = str(ciks[0]).zfill(10) if ciks else ''
 
-        title_text = entry.findtext('atom:title', default='', namespaces=ns)
-        company = title_text.split(' - ', 1)[1].split(' (')[0].strip() if ' - ' in title_text else title_text
+        display_names = src.get('display_names', [])
+        company = display_names[0] if display_names else ''
 
         form4_entries.append({
             'cik': cik,
             'company': company,
             'form_type': form_type,
-            'date_filed': date_filed,
+            'date_filed': file_date,
             'filename': filename
         })
 
@@ -223,8 +222,8 @@ def run_daily_etl(target_date_str=None):
 
     today_str = datetime.today().strftime('%Y-%m-%d')
     if target_date_str == today_str:
-        print(f"Fetching live SEC Atom feed for today ({target_date_str})...")
-        filtered_entries = fetch_live_atom_feed(target_date_str)
+        print(f"Fetching live SEC EFTS Search API for today ({target_date_str})...")
+        filtered_entries = fetch_efts_search_api(target_date_str)
     else:
         target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
         qtr = (target_dt.month - 1) // 3 + 1
