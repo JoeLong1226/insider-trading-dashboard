@@ -143,15 +143,20 @@ def fetch_live_sec_rss():
     url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&output=atom"
     response = None
     
+    print("Sending request to SEC RSS feed...")
     for attempt in range(3):
         try:
             response = requests.get(url, headers=HEADERS, timeout=45)
+            print(f"Attempt {attempt + 1} Status Code: {response.status_code}")
             if response.status_code == 200:
                 break
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as e:
+            print(f"Attempt {attempt + 1} Request Exception: {e}")
             time.sleep(3)
 
     if not response or response.status_code != 200:
+        status = response.status_code if response else 'No Response'
+        print(f"FAILED to fetch SEC RSS feed. Final Status: {status}")
         return []
     
     try:
