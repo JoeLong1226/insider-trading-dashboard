@@ -140,7 +140,6 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
         return None, 'Unknown', None
 
 def fetch_live_sec_rss():
-    """Fetches real-time Form 4 filings directly from SEC EDGAR Atom feed with retry logic."""
     url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&output=atom"
     response = None
     
@@ -149,13 +148,10 @@ def fetch_live_sec_rss():
             response = requests.get(url, headers=HEADERS, timeout=45)
             if response.status_code == 200:
                 break
-            print(f"SEC RSS attempt {attempt + 1} returned status code {response.status_code}")
-        except requests.exceptions.RequestException as e:
-            print(f"SEC RSS attempt {attempt + 1} failed ({e}); retrying...")
+        except requests.exceptions.RequestException:
             time.sleep(3)
 
     if not response or response.status_code != 200:
-        print("Failed to fetch SEC RSS feed after 3 attempts.")
         return []
     
     try:
@@ -165,6 +161,9 @@ def fetch_live_sec_rss():
 
         for entry in root.findall('atom:entry', ns):
             title = entry.findtext('atom:title', default='', namespaces=ns)
+            if '4' not in title.upper():
+                continue
+
             updated = entry.findtext('atom:updated', default='', namespaces=ns)
             link_el = entry.find('atom:link', namespaces=ns)
             href = link_el.get('href') if link_el is not None else ''
@@ -172,20 +171,26 @@ def fetch_live_sec_rss():
             if not href or 'edgar/data/' not in href:
                 continue
 
-            parts = href.split('/')
-            if len(parts) >= 7:
-                cik = parts[4]
-                accession_dash = parts[5]
-                filename = f"edgar/data/{cik}/{accession_dash}.txt"
-                
-                entries.append({
-                    'cik': cik,
-                    'company': title.split(' - ')[0] if ' - ' in title else 'UNKNOWN',
-                    'form_type': '4',
-                    'date_filed': updated[:10],
-                    'filename': filename,
-                    'accession_number': accession_dash
-                })
+            if href.endswith('-index.htm'):
+                base_path = href.replace('-index.htm', '')
+                filename = f"{base_path.lstrip('/')}.txt"
+            elif 'edgar/data/' in href:
+                clean_href = href.split('?')[0]
+                if clean_href.endswith('.htm'):
+                    clean_href = clean_href.rsplit('/', 1)[0]
+                filename = f"{clean_href.lstrip('/')}.txt"
+            else:
+                continue
+
+            form_type = '4/A' if '4/A' in title.upper() or 'AMENDMENT' in title.upper() else '4'
+
+            entries.append({
+                'company': title.split(' - ')[0] if ' - ' in title else 'UNKNOWN',
+                'form_type': form_type,
+                'date_filed': updated[:10],
+                'filename': filename,
+                'accession_number': filename.split('/')[-1].replace('.txt', '')
+            })
         print(f"Successfully parsed {len(entries)} Form 4 entries from live RSS feed.")
         return entries
     except Exception as e:
@@ -193,7 +198,6 @@ def fetch_live_sec_rss():
         return []
 
 def fetch_efts_search_api(target_date_str):
-    """Exhaustive search API for audit/nightly reconciliation sweeps."""
     url = f"https://efts.sec.gov/LATEST/search-index?q=*&forms=4,4/A&dateRange=custom&startdt={target_date_str}&enddt={target_date_str}"
     response = None
     for attempt in range(3):
@@ -227,16 +231,10 @@ def fetch_efts_search_api(target_date_str):
         else:
             continue
 
-        ciks = src.get('ciks', [])
-        cik = str(ciks[0]).zfill(10) if ciks else ''
-
-        display_names = src.get('display_names', [])
-        company = display_names[0] if display_names else ''
         accession_dash = filename.split('/')[-1].replace('.txt', '')
 
         form4_entries.append({
-            'cik': cik,
-            'company': company,
+            'company': src.get('display_names', [''])[0],
             'form_type': form_type,
             'date_filed': file_date,
             'filename': filename,
@@ -247,9 +245,7 @@ def fetch_efts_search_api(target_date_str):
 
 def get_existing_accessions(cursor):
     cursor.execute("SELECT accession_number FROM insider_trades WHERE accession_number IS NOT NULL;")
-    accessions = {row[0] for row in cursor.fetchall()}
-    print(f"Loaded {len(accessions)} existing accession numbers from Supabase.")
-    return accessions
+    return {row[0] for row in cursor.fetchall()}
 
 def process_entries(entries, existing_accessions, cursor, conn):
     insert_query = """
@@ -274,22 +270,19 @@ def process_entries(entries, existing_accessions, cursor, conn):
     for idx, entry in enumerate(entries):
         acc_num = entry['accession_number']
         if acc_num in existing_accessions and entry.get('form_type') != '4/A':
-            print(f"[{idx+1}/{len(entries)}] Skipping {acc_num} (already in DB)")
             continue
 
         txt_url = f"https://www.sec.gov/Archives/{entry['filename']}"
-        time.sleep(0.12)  # Respect SEC rate limits
+        time.sleep(0.12)  
          
         try:
             res = requests.get(txt_url, headers=HEADERS, timeout=15)
             if res.status_code != 200 or "<xml>" not in res.text.lower():
-                print(f"[{idx+1}/{len(entries)}] Skipped {acc_num}: Invalid status ({res.status_code}) or no XML found.")
                 continue
                  
             xml_start = res.text.find("<XML>")
             xml_end = res.text.find("</XML>")
             if xml_start == -1 or xml_end == -1:
-                print(f"[{idx+1}/{len(entries)}] Skipped {acc_num}: XML tags not found.")
                 continue
                  
             xml_content = res.text[xml_start+5:xml_end].strip()
@@ -304,7 +297,6 @@ def process_entries(entries, existing_accessions, cursor, conn):
                     break
              
             if not ticker or ticker in ['NONE', '[NONE]', 'UNKNOWN', 'N/A'] or (len(ticker) == 5 and ticker.endswith('X')):
-                print(f"[{idx+1}/{len(entries)}] Skipped {acc_num}: Invalid ticker found ({ticker}).")
                 continue
 
             company_name = entry.get('company', '')
@@ -337,7 +329,6 @@ def process_entries(entries, existing_accessions, cursor, conn):
                         print(f"-> Found Purchase: {ticker} | Insider: {insider} | Value: ${est_val:,.2f}")
                         
                         if est_val < 50000:
-                            print(f"   Skipped: Value ${est_val:,.2f} is under $50k threshold.")
                             continue
                              
                         owned_str = tx.findtext(".//sharesOwnedFollowingTransaction/value")
@@ -364,9 +355,7 @@ def process_entries(entries, existing_accessions, cursor, conn):
                             print(f"*** SUCCESS: Inserted {ticker} trade (${est_val:,.2f}) into Supabase! ***")
                         except Exception as db_err:
                             conn.rollback()
-                            print(f"*** DATABASE ERROR inserting {ticker}: {db_err} ***")
-        except Exception as parse_err:
-            print(f"[{idx+1}/{len(entries)}] Error parsing filing {acc_num}: {parse_err}")
+        except Exception:
             continue
             
     return inserted_count
@@ -386,7 +375,7 @@ def run_realtime_poll():
     print(f"--- Live Poll complete. Inserted {inserted} new trades. ---")
 
 def run_nightly_audit(target_date_str):
-    print(f"[{datetime.now()}] Running nightly reconciliation audit for {target_date_str}...")
+    print(f"[{datetime.now()}] Running reconciliation audit for {target_date_str}...")
     entries = fetch_efts_search_api(target_date_str)
     print(f"Found {len(entries)} total filings via EFTS search index for audit date.")
 
@@ -398,10 +387,12 @@ def run_nightly_audit(target_date_str):
 
     cursor.close()
     conn.close()
-    print(f"--- Nightly Audit complete. Reconciled and inserted {inserted} missing trades. ---")
+    print(f"--- Audit complete. Reconciled and inserted {inserted} missing trades. ---")
 
 if __name__ == "__main__":
     import sys
+    # If you pass 'audit YYYY-MM-DD', it runs the full historical search index sweep for that day.
+    # Otherwise, it runs the live RSS feed poll.
     if len(sys.argv) >= 3 and sys.argv[1].strip() == 'audit':
         run_nightly_audit(sys.argv[2].strip())
     else:
