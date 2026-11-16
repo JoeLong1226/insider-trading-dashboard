@@ -8,7 +8,7 @@ import requests
 import xml.etree.ElementTree as ET
 import yfinance as yf
 
-# Use a valid contact email format required by SEC EDGAR fair-access policy
+# SEC requires a descriptive User-Agent with contact email
 HEADERS = {'User-Agent': 'InsiderTradingApp JosephLong1226@gmail.com'}
 SUPABASE_URL = os.environ.get("SUPABASE_DB_URL")
 
@@ -131,7 +131,7 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
 
         historical_mcap = price * shares
         category, benchmark = assign_market_cap_tier(historical_mcap)
-        
+         
         result = (historical_mcap, category, benchmark)
         mcap_cache[cache_key] = result
         return result
@@ -139,32 +139,48 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
         mcap_cache[cache_key] = (None, 'Unknown', None)
         return None, 'Unknown', None
 
-def fetch_quarterly_index(year, quarter):
-    url = f"https://www.sec.gov/Archives/edgar/full-index/{year}/QTR{quarter}/master.idx"
-    response = requests.get(url, headers=HEADERS, timeout=30)
-    if response.status_code != 200:
+def fetch_live_sec_rss():
+    """Fetches real-time Form 4 filings directly from SEC EDGAR Atom feed."""
+    url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&output=atom"
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=30)
+        if response.status_code != 200:
+            return []
+        
+        root = ET.fromstring(response.content)
+        ns = {'atom': 'http://www.w3.org/2005/Atom'}
+        entries = []
+
+        for entry in root.findall('atom:entry', ns):
+            title = entry.findtext('atom:title', default='', namespaces=ns)
+            updated = entry.findtext('atom:updated', default='', namespaces=ns)
+            link_el = entry.find('atom:link', namespaces=ns)
+            href = link_el.get('href') if link_el is not None else ''
+            
+            if not href or 'edgar/data/' not in href:
+                continue
+
+            parts = href.split('/')
+            if len(parts) >= 7:
+                cik = parts[4]
+                accession_dash = parts[5]
+                filename = f"edgar/data/{cik}/{accession_dash}.txt"
+                
+                entries.append({
+                    'cik': cik,
+                    'company': title.split(' - ')[0] if ' - ' in title else 'UNKNOWN',
+                    'form_type': '4',
+                    'date_filed': updated[:10],
+                    'filename': filename,
+                    'accession_number': accession_dash
+                })
+        return entries
+    except Exception as e:
+        print(f"Error parsing SEC RSS feed: {e}")
         return []
 
-    lines = response.text.split('\n')
-    form4_entries = []
-    data_started = False
-    for line in lines:
-        if "CIK|Company Name|Form Type|Date Filed|Filename" in line:
-            data_started = True
-            continue
-        if data_started and line.strip():
-            parts = line.split('|')
-            if len(parts) == 5 and parts[2].strip() in ('4', '4/A'):
-                form4_entries.append({
-                    'cik': parts[0],
-                    'company': parts[1],
-                    'form_type': parts[2].strip(),
-                    'date_filed': parts[3],
-                    'filename': parts[4].strip()
-                })
-    return form4_entries
-
 def fetch_efts_search_api(target_date_str):
+    """Exhaustive search API for audit/nightly reconciliation sweeps."""
     url = f"https://efts.sec.gov/LATEST/search-index?q=*&forms=4,4/A&dateRange=custom&startdt={target_date_str}&enddt={target_date_str}"
     response = None
     for attempt in range(3):
@@ -172,12 +188,10 @@ def fetch_efts_search_api(target_date_str):
             response = requests.get(url, headers=HEADERS, timeout=30)
             if response.status_code == 200:
                 break
-        except requests.exceptions.RequestException as e:
-            print(f"EFTS Search API attempt {attempt + 1} failed ({e}); retrying...")
+        except requests.exceptions.RequestException:
             time.sleep(2)
 
     if not response or response.status_code != 200:
-        print("Could not reach EFTS Search API after 3 attempts.")
         return []
 
     data = response.json()
@@ -205,36 +219,33 @@ def fetch_efts_search_api(target_date_str):
 
         display_names = src.get('display_names', [])
         company = display_names[0] if display_names else ''
+        accession_dash = filename.split('/')[-1].replace('.txt', '')
 
         form4_entries.append({
             'cik': cik,
             'company': company,
             'form_type': form_type,
             'date_filed': file_date,
-            'filename': filename
+            'filename': filename,
+            'accession_number': accession_dash
         })
 
     return form4_entries
 
-def run_daily_etl(target_date_str=None):
-    if not target_date_str:
-        target_date_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+def get_existing_accessions(cursor):
+    cursor.execute("SELECT accession_number FROM insider_trades WHERE accession_number IS NOT NULL;")
+    return {row[0] for row in cursor.fetchall()}
 
-    today_str = datetime.today().strftime('%Y-%m-%d')
-    if target_date_str == today_str:
-        print(f"Fetching live SEC EFTS Search API for today ({target_date_str})...")
-        filtered_entries = fetch_efts_search_api(target_date_str)
-    else:
-        target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-        qtr = (target_dt.month - 1) // 3 + 1
-        print(f"Fetching QTR {qtr} index for {target_dt.year} (Target Date: {target_date_str})...")
-        all_entries = fetch_quarterly_index(target_dt.year, qtr)
-        filtered_entries = [e for e in all_entries if e['date_filed'] == target_date_str]
-
-    print(f"Found {len(filtered_entries)} Form 4 filings filed on {target_date_str}.")
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
+def process_entries(entries, existing_accessions, cursor, conn):
+    insert_query = """
+        INSERT INTO insider_trades (
+            transaction_date, ticker, sector, insider_name, insider_title, 
+            shares_bought, shares_owned_following, est_value, activity_type,
+            market_cap, market_cap_category, benchmark_ticker, is_10b51, accession_number, price_at_tx
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (accession_number) DO NOTHING;
+    """
 
     delete_amended_query = """
         DELETE FROM insider_trades
@@ -244,20 +255,16 @@ def run_daily_etl(target_date_str=None):
           AND accession_number IS DISTINCT FROM %s;
     """
 
-    insert_query = """
-        INSERT INTO insider_trades (
-            transaction_date, ticker, sector, insider_name, insider_title, 
-            shares_bought, shares_owned_following, est_value, activity_type,
-            market_cap, market_cap_category, benchmark_ticker, is_10b51, accession_number, price_at_tx
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT DO NOTHING;
-    """
-
     inserted_count = 0
-    for entry in filtered_entries:
+    for entry in entries:
+        acc_num = entry['accession_number']
+        # If running real-time, skip already known accessions to save time. 
+        # If running nightly audit sweep, this ensures we only process missing ones.
+        if acc_num in existing_accessions and entry.get('form_type') != '4/A':
+            continue
+
         txt_url = f"https://www.sec.gov/Archives/{entry['filename']}"
-        time.sleep(0.12)
+        time.sleep(0.12)  # Respect SEC rate limits
          
         try:
             res = requests.get(txt_url, headers=HEADERS, timeout=15)
@@ -289,8 +296,6 @@ def run_daily_etl(target_date_str=None):
             owners = root.findall(".//reportingOwner")
             if not owners:
                 owners = [root]
-
-            accession_number = entry['filename'].split('/')[-1].replace('.txt', '')
 
             for owner in owners:
                 insider = owner.findtext(".//rptOwnerName") or "UNKNOWN"
@@ -326,30 +331,68 @@ def run_daily_etl(target_date_str=None):
                         try:
                             if entry.get('form_type') == '4/A':
                                 cursor.execute(delete_amended_query, (
-                                    ticker, insider, tx_date, accession_number
+                                    ticker, insider, tx_date, acc_num
                                 ))
 
                             cursor.execute(insert_query, (
                                 tx_date, ticker, sector, insider, title, shares, owned, est_val, "Purchase",
-                                float(mcap) if mcap else None, category, benchmark, is_10b51, accession_number, price
+                                float(mcap) if mcap else None, category, benchmark, is_10b51, acc_num, price
                             ))
                             conn.commit()
                             inserted_count += 1
-                        except Exception as db_err:
+                            existing_accessions.add(acc_num)
+                        except Exception:
                             conn.rollback()
         except Exception:
             continue
+            
+    return inserted_count
+
+def run_realtime_poll():
+    print(f"[{datetime.now()}] Polling live SEC RSS feed...")
+    entries = fetch_live_sec_rss()
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    existing_accessions = get_existing_accessions(cursor)
+    
+    inserted = process_entries(entries, existing_accessions, cursor, conn)
+    
+    cursor.close()
+    conn.close()
+    print(f"--- Live Poll complete. Inserted {inserted} new trades. ---")
+
+def run_nightly_audit(target_date_str=None):
+    if not target_date_str:
+        target_date_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+        
+    print(f"[{datetime.now()}] Running nightly reconciliation audit for {target_date_str}...")
+    entries = fetch_efts_search_api(target_date_str)
+    print(f"Found {len(entries)} total filings via EFTS search index for audit date.")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    existing_accessions = get_existing_accessions(cursor)
+
+    inserted = process_entries(entries, existing_accessions, cursor, conn)
 
     cursor.close()
     conn.close()
-    print(f"--- Daily ETL completed for {target_date_str}. Inserted {inserted_count} new trades. ---")
+    print(f"--- Nightly Audit complete. Reconciled and inserted {inserted} missing trades. ---")
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) >= 2 and sys.argv[1].strip():
-        run_daily_etl(sys.argv[1].strip())
+    # If you pass an argument like 'audit 2026-11-16', it runs the reconciliation sweep.
+    # Otherwise, it runs as the continuous live daemon.
+    if len(sys.argv) >= 3 and sys.argv[1].strip() == 'audit':
+        run_nightly_audit(sys.argv[2].strip())
     else:
-        yesterday = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
-        today = datetime.today().strftime('%Y-%m-%d')
-        run_daily_etl(yesterday)
-        run_daily_etl(today)
+        print("Starting Insider Trading Live Feed Daemon...")
+        while True:
+            try:
+                run_realtime_poll()
+            except Exception as e:
+                print(f"Error in live polling loop: {e}")
+            
+            print("Waiting 5 minutes for next poll...")
+            time.sleep(300)
