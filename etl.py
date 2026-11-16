@@ -2,6 +2,7 @@ import os
 import time
 import re
 from datetime import datetime, timedelta
+import pandas as pd
 import psycopg2
 import requests
 import xml.etree.ElementTree as ET
@@ -153,10 +154,11 @@ def fetch_quarterly_index(year, quarter):
             continue
         if data_started and line.strip():
             parts = line.split('|')
-            if len(parts) == 5 and parts[2] in ('4', '4/A'):
+            if len(parts) == 5 and parts[2].strip() in ('4', '4/A'):
                 form4_entries.append({
                     'cik': parts[0],
                     'company': parts[1],
+                    'form_type': parts[2].strip(),
                     'date_filed': parts[3],
                     'filename': parts[4].strip()
                 })
@@ -176,6 +178,14 @@ def run_daily_etl(target_date_str=None):
 
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    delete_amended_query = """
+        DELETE FROM insider_trades
+        WHERE ticker = %s
+          AND insider_name = %s
+          AND transaction_date = %s
+          AND accession_number IS DISTINCT FROM %s;
+    """
 
     insert_query = """
         INSERT INTO insider_trades (
@@ -257,6 +267,11 @@ def run_daily_etl(target_date_str=None):
                         mcap, category, benchmark = get_point_in_time_metadata(ticker, tx_date)
                          
                         try:
+                            if entry.get('form_type') == '4/A':
+                                cursor.execute(delete_amended_query, (
+                                    ticker, insider, tx_date, accession_number
+                                ))
+
                             cursor.execute(insert_query, (
                                 tx_date, ticker, sector, insider, title, shares, owned, est_val, "Purchase",
                                 float(mcap) if mcap else None, category, benchmark, is_10b51, accession_number, price
