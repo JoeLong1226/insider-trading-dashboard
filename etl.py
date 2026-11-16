@@ -141,7 +141,7 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
 
 def fetch_quarterly_index(year, quarter):
     url = f"https://www.sec.gov/Archives/edgar/full-index/{year}/QTR{quarter}/master.idx"
-    response = requests.get(url, headers=HEADERS, timeout=15)
+    response = requests.get(url, headers=HEADERS, timeout=30)
     if response.status_code != 200:
         return []
 
@@ -166,8 +166,18 @@ def fetch_quarterly_index(year, quarter):
 
 def fetch_live_atom_feed(target_date_str):
     url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=only&count=100&output=atom"
-    response = requests.get(url, headers=HEADERS, timeout=15)
-    if response.status_code != 200:
+    response = None
+    for attempt in range(3):
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=30)
+            if response.status_code == 200:
+                break
+        except requests.exceptions.RequestException as e:
+            print(f"Live Atom feed attempt {attempt + 1} failed ({e}); retrying...")
+            time.sleep(2)
+
+    if not response or response.status_code != 200:
+        print("Could not reach live Atom feed after 3 attempts; skipping live check.")
         return []
 
     ns = {'atom': 'http://www.w3.org/2005/Atom'}
@@ -252,7 +262,7 @@ def run_daily_etl(target_date_str=None):
         time.sleep(0.12)
          
         try:
-            res = requests.get(txt_url, headers=HEADERS, timeout=8)
+            res = requests.get(txt_url, headers=HEADERS, timeout=15)
             if res.status_code != 200 or "<xml>" not in res.text.lower():
                 continue
                  
