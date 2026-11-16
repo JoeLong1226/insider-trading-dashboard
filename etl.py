@@ -165,7 +165,7 @@ def fetch_quarterly_index(year, quarter):
     return form4_entries
 
 def fetch_live_atom_feed(target_date_str):
-    url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=only&count=100&output=atom"
+    url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=only&count=500&output=atom"
     response = None
     for attempt in range(3):
         try:
@@ -200,7 +200,6 @@ def fetch_live_atom_feed(target_date_str):
         if '/Archives/' not in href or '-index.htm' not in href:
             continue
 
-        # Convert https://www.sec.gov/Archives/edgar/data/CIK/ACC-index.htm -> edgar/data/CIK/ACC.txt
         filename = href.split('/Archives/')[1].replace('-index.htm', '.txt').strip()
         parts = filename.split('/')
         cik = parts[2] if len(parts) >= 3 else ''
