@@ -186,6 +186,7 @@ def fetch_live_sec_rss():
                     'filename': filename,
                     'accession_number': accession_dash
                 })
+        print(f"Successfully parsed {len(entries)} Form 4 entries from live RSS feed.")
         return entries
     except Exception as e:
         print(f"Error parsing SEC RSS XML content: {e}")
@@ -246,7 +247,9 @@ def fetch_efts_search_api(target_date_str):
 
 def get_existing_accessions(cursor):
     cursor.execute("SELECT accession_number FROM insider_trades WHERE accession_number IS NOT NULL;")
-    return {row[0] for row in cursor.fetchall()}
+    accessions = {row[0] for row in cursor.fetchall()}
+    print(f"Loaded {len(accessions)} existing accession numbers from Supabase.")
+    return accessions
 
 def process_entries(entries, existing_accessions, cursor, conn):
     insert_query = """
@@ -268,9 +271,10 @@ def process_entries(entries, existing_accessions, cursor, conn):
     """
 
     inserted_count = 0
-    for entry in entries:
+    for idx, entry in enumerate(entries):
         acc_num = entry['accession_number']
         if acc_num in existing_accessions and entry.get('form_type') != '4/A':
+            print(f"[{idx+1}/{len(entries)}] Skipping {acc_num} (already in DB)")
             continue
 
         txt_url = f"https://www.sec.gov/Archives/{entry['filename']}"
@@ -279,11 +283,13 @@ def process_entries(entries, existing_accessions, cursor, conn):
         try:
             res = requests.get(txt_url, headers=HEADERS, timeout=15)
             if res.status_code != 200 or "<xml>" not in res.text.lower():
+                print(f"[{idx+1}/{len(entries)}] Skipped {acc_num}: Invalid status ({res.status_code}) or no XML found.")
                 continue
                  
             xml_start = res.text.find("<XML>")
             xml_end = res.text.find("</XML>")
             if xml_start == -1 or xml_end == -1:
+                print(f"[{idx+1}/{len(entries)}] Skipped {acc_num}: XML tags not found.")
                 continue
                  
             xml_content = res.text[xml_start+5:xml_end].strip()
@@ -298,6 +304,7 @@ def process_entries(entries, existing_accessions, cursor, conn):
                     break
              
             if not ticker or ticker in ['NONE', '[NONE]', 'UNKNOWN', 'N/A'] or (len(ticker) == 5 and ticker.endswith('X')):
+                print(f"[{idx+1}/{len(entries)}] Skipped {acc_num}: Invalid ticker found ({ticker}).")
                 continue
 
             company_name = entry.get('company', '')
@@ -327,7 +334,10 @@ def process_entries(entries, existing_accessions, cursor, conn):
                         price = float(price_str) if price_str else 0.0
                         
                         est_val = shares * price
+                        print(f"-> Found Purchase: {ticker} | Insider: {insider} | Value: ${est_val:,.2f}")
+                        
                         if est_val < 50000:
+                            print(f"   Skipped: Value ${est_val:,.2f} is under $50k threshold.")
                             continue
                              
                         owned_str = tx.findtext(".//sharesOwnedFollowingTransaction/value")
@@ -351,9 +361,12 @@ def process_entries(entries, existing_accessions, cursor, conn):
                             conn.commit()
                             inserted_count += 1
                             existing_accessions.add(acc_num)
-                        except Exception:
+                            print(f"*** SUCCESS: Inserted {ticker} trade (${est_val:,.2f}) into Supabase! ***")
+                        except Exception as db_err:
                             conn.rollback()
-        except Exception:
+                            print(f"*** DATABASE ERROR inserting {ticker}: {db_err} ***")
+        except Exception as parse_err:
+            print(f"[{idx+1}/{len(entries)}] Error parsing filing {acc_num}: {parse_err}")
             continue
             
     return inserted_count
@@ -361,7 +374,6 @@ def process_entries(entries, existing_accessions, cursor, conn):
 def run_realtime_poll():
     print(f"[{datetime.now()}] Polling live SEC RSS feed...")
     entries = fetch_live_sec_rss()
-    print(f"Fetched {len(entries)} entries from live RSS feed.")
     
     conn = get_db_connection()
     cursor = conn.cursor()
