@@ -289,7 +289,10 @@ def run_daily_etl(target_date_str=None):
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) >= 2:
-        run_daily_etl(sys.argv[1])
+    if len(sys.argv) >= 2 and sys.argv[1].strip():
+        run_daily_etl(sys.argv[1].strip())
     else:
-        run_daily_etl()
+        yesterday = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
+        today = datetime.today().strftime('%Y-%m-%d')
+        run_daily_etl(yesterday)
+        run_daily_etl(today)
