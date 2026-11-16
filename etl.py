@@ -145,6 +145,7 @@ def fetch_live_sec_rss():
     try:
         response = requests.get(url, headers=HEADERS, timeout=30)
         if response.status_code != 200:
+            print(f"Failed to fetch SEC RSS feed. Status: {response.status_code}")
             return []
         
         root = ET.fromstring(response.content)
@@ -258,8 +259,6 @@ def process_entries(entries, existing_accessions, cursor, conn):
     inserted_count = 0
     for entry in entries:
         acc_num = entry['accession_number']
-        # If running real-time, skip already known accessions to save time. 
-        # If running nightly audit sweep, this ensures we only process missing ones.
         if acc_num in existing_accessions and entry.get('form_type') != '4/A':
             continue
 
@@ -351,6 +350,7 @@ def process_entries(entries, existing_accessions, cursor, conn):
 def run_realtime_poll():
     print(f"[{datetime.now()}] Polling live SEC RSS feed...")
     entries = fetch_live_sec_rss()
+    print(f"Fetched {len(entries)} entries from live RSS feed.")
     
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -362,10 +362,7 @@ def run_realtime_poll():
     conn.close()
     print(f"--- Live Poll complete. Inserted {inserted} new trades. ---")
 
-def run_nightly_audit(target_date_str=None):
-    if not target_date_str:
-        target_date_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
-        
+def run_nightly_audit(target_date_str):
     print(f"[{datetime.now()}] Running nightly reconciliation audit for {target_date_str}...")
     entries = fetch_efts_search_api(target_date_str)
     print(f"Found {len(entries)} total filings via EFTS search index for audit date.")
@@ -382,17 +379,10 @@ def run_nightly_audit(target_date_str=None):
 
 if __name__ == "__main__":
     import sys
-    # If you pass an argument like 'audit 2026-11-16', it runs the reconciliation sweep.
-    # Otherwise, it runs as the continuous live daemon.
     if len(sys.argv) >= 3 and sys.argv[1].strip() == 'audit':
         run_nightly_audit(sys.argv[2].strip())
     else:
-        print("Starting Insider Trading Live Feed Daemon...")
-        while True:
-            try:
-                run_realtime_poll()
-            except Exception as e:
-                print(f"Error in live polling loop: {e}")
-            
-            print("Waiting 5 minutes for next poll...")
-            time.sleep(300)
+        try:
+            run_realtime_poll()
+        except Exception as e:
+            print(f"Error in live poll execution: {e}")
