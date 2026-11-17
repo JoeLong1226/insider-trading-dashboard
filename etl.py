@@ -7,6 +7,7 @@ import psycopg2
 import requests
 import xml.etree.ElementTree as ET
 import yfinance as yf
+import pytz
 
 # SEC requires a descriptive User-Agent with contact email
 HEADERS = {'User-Agent': 'InsiderTradingApp JosephLong1226@gmail.com'}
@@ -139,8 +140,8 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
         mcap_cache[cache_key] = (None, 'Unknown', None)
         return None, 'Unknown', None
 
-def fetch_efts_search_api(target_date_str):
-    url = f"https://efts.sec.gov/LATEST/search-index?q=*&forms=4,4/A&dateRange=custom&startdt={target_date_str}&enddt={target_date_str}"
+def fetch_efts_search_api(start_date_str, end_date_str):
+    url = f"https://efts.sec.gov/LATEST/search-index?q=*&forms=4,4/A&dateRange=custom&startdt={start_date_str}&enddt={end_date_str}"
     response = None
     for attempt in range(3):
         try:
@@ -168,7 +169,7 @@ def fetch_efts_search_api(target_date_str):
                 continue
 
             file_date = src.get('file_date', '')
-            if file_date != target_date_str:
+            if not (start_date_str <= file_date <= end_date_str):
                 continue
 
             _id = hit.get('_id', '')
@@ -189,7 +190,7 @@ def fetch_efts_search_api(target_date_str):
                 'accession_number': accession_dash
             })
 
-        print(f"Successfully fetched {len(form4_entries)} Form 4 entries for {target_date_str} via EFTS index.")
+        print(f"Successfully fetched {len(form4_entries)} Form 4 entries for range {start_date_str} to {end_date_str} via EFTS index.")
         return form4_entries
     except Exception as e:
         print(f"Error parsing EFTS JSON response: {e}")
@@ -232,14 +233,12 @@ def process_entries(entries, existing_accessions, cursor, conn):
         try:
             res = requests.get(txt_url, headers=HEADERS, timeout=15)
             if res.status_code != 200:
-                print(f"[{idx+1}/{len(entries)}] Skipped {acc_num}: HTTP status {res.status_code}")
                 continue
                  
             text_lower = res.text.lower()
             xml_start = text_lower.find("<xml>")
             xml_end = text_lower.find("</xml>")
             if xml_start == -1 or xml_end == -1:
-                print(f"[{idx+1}/{len(entries)}] Skipped {acc_num}: XML tags not found.")
                 continue
                  
             xml_content = res.text[xml_start+5:xml_end].strip()
@@ -254,7 +253,6 @@ def process_entries(entries, existing_accessions, cursor, conn):
                     break
              
             if not ticker or ticker in ['NONE', '[NONE]', 'UNKNOWN', 'N/A'] or (len(ticker) == 5 and ticker.endswith('X')):
-                print(f"[{idx+1}/{len(entries)}] Skipped {acc_num}: Invalid ticker ({ticker}).")
                 continue
 
             company_name = entry.get('company', '')
@@ -284,10 +282,7 @@ def process_entries(entries, existing_accessions, cursor, conn):
                         price = float(price_str) if price_str else 0.0
                         
                         est_val = shares * price
-                        print(f"-> Found Purchase: {ticker} | Insider: {insider} | Value: ${est_val:,.2f}")
-                        
                         if est_val < 50000:
-                            print(f"   Skipped: Value ${est_val:,.2f} is under $50k threshold.")
                             continue
                              
                         owned_str = tx.findtext(".//sharesOwnedFollowingTransaction/value")
@@ -315,21 +310,36 @@ def process_entries(entries, existing_accessions, cursor, conn):
                         except Exception as db_err:
                             conn.rollback()
                             print(f"*** DATABASE ERROR inserting {ticker}: {db_err} ***")
-        except Exception as parse_err:
-            print(f"[{idx+1}/{len(entries)}] Error parsing filing {acc_num}: {parse_err}")
+        except Exception:
             continue
             
     return inserted_count
 
 if __name__ == "__main__":
     import sys
-    # Usage: python etl.py [YYYY-MM-DD]
-    # If no date argument is provided, it defaults to today's date.
-    target_date = sys.argv[1].strip() if len(sys.argv) > 1 else datetime.utcnow().strftime('%Y-%m-%d')
+    
+    # Use Eastern Time for proper day calculation so real-time cron jobs don't roll over prematurely in UTC
+    eastern = timezone('US/Eastern') if 'timezone' in globals() else None
+    try:
+        from pytz import timezone
+        eastern = timezone('US/Eastern')
+        today_str = datetime.now(eastern).strftime('%Y-%m-%d')
+        yesterday_str = (datetime.now(eastern) - timedelta(days=1)).strftime('%Y-%m-%d')
+    except Exception:
+        today_str = datetime.utcnow().strftime('%Y-%m-%d')
+        yesterday_str = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    # If an argument is provided, use it as start date; otherwise look back across yesterday and today to catch real-time filings safely
+    if len(sys.argv) > 1 and sys.argv[1].strip():
+        start_date = sys.argv[1].strip()
+        end_date = sys.argv[2].strip() if len(sys.argv) > 2 else today_str
+    else:
+        start_date = yesterday_str
+        end_date = today_str
     
     try:
-        print(f"[{datetime.now()}] Running ETL execution for date: {target_date}")
-        entries = fetch_efts_search_api(target_date)
+        print(f"[{datetime.now()}] Running ETL execution for date range: {start_date} to {end_date}")
+        entries = fetch_efts_search_api(start_date, end_date)
         
         conn = get_db_connection()
         cursor = conn.cursor()
