@@ -2,7 +2,8 @@ name: Run Insider Trading ETL Live
 
 on:
   schedule:
-    # Live polling every 5 min while EDGAR accepts filings (6am-10pm ET), weekdays
+    # Live polling while EDGAR accepts filings (6am-10pm ET), weekdays.
+    # NOTE: GitHub treats these times as best-effort; real runs often come every 30-60 min.
     - cron: '*/5 10-23 * * 1-5'
     - cron: '*/5 0-3 * * 2-6'
     # Nightly catch-up sweep of the previous day's filings (~3:30-4:30am ET)
@@ -10,12 +11,22 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'live = latest filings, daily = sweep yesterday'
+        description: 'live = latest filings, daily = sweep by date'
         default: 'live'
         type: choice
         options:
           - live
           - daily
+      start_date:
+        description: 'daily mode only: first filing date to sweep (YYYY-MM-DD). Blank = yesterday'
+        required: false
+        default: ''
+        type: string
+      end_date:
+        description: 'daily mode only: last filing date (YYYY-MM-DD). Blank = same as start'
+        required: false
+        default: ''
+        type: string
 
 # Never run two ETL jobs at once (avoids duplicate work / DB races)
 concurrency:
@@ -25,7 +36,7 @@ concurrency:
 jobs:
   run-etl:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -46,9 +57,11 @@ jobs:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           SCHEDULE: ${{ github.event.schedule }}
           MODE_INPUT: ${{ github.event.inputs.mode }}
+          START_DATE: ${{ github.event.inputs.start_date }}
+          END_DATE: ${{ github.event.inputs.end_date }}
         run: |
           if [ "$SCHEDULE" = "30 8 * * 2-6" ] || [ "$MODE_INPUT" = "daily" ]; then
-            python etl.py daily
+            python etl.py daily "$START_DATE" "$END_DATE"
           else
             python etl.py
           fi
