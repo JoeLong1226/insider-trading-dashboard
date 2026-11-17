@@ -1,24 +1,42 @@
+"""
+Live Form 4 ETL: SEC EDGAR -> Supabase (insider_trades)
+
+Usage:
+  python etl.py                      # live mode: poll EDGAR's "latest filings" Atom feed
+  python etl.py daily [YYYY-MM-DD]   # catch-up sweep from the daily index (default: yesterday, ET)
+"""
 import os
-import time
 import re
+import sys
+import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import psycopg2
 import requests
-import xml.etree.ElementTree as ET
 import yfinance as yf
-import pytz
 
 # SEC requires a descriptive User-Agent with contact email
 HEADERS = {'User-Agent': 'InsiderTradingApp JosephLong1226@gmail.com'}
 SUPABASE_URL = os.environ.get("SUPABASE_DB_URL")
+
+MIN_VALUE = 50_000
+EASTERN = ZoneInfo("America/New_York")
+
 
 def get_db_connection():
     if not SUPABASE_URL:
         raise ValueError("Missing database connection string. Set SUPABASE_DB_URL.")
     return psycopg2.connect(SUPABASE_URL)
 
+
+# ---------------------------------------------------------------------------
+# Sector / ticker / market-cap helpers (unchanged from your working version)
+# ---------------------------------------------------------------------------
 sector_cache = {}
+
 
 def infer_sector_from_name(company_name):
     name = company_name.upper()
@@ -36,14 +54,15 @@ def infer_sector_from_name(company_name):
         return "Basic Materials"
     return "General Equity"
 
+
 def get_sector_for_ticker(ticker, company_name=""):
     if not ticker or ticker in ("NONE", "UNKNOWN", "N/A", "NULL"):
         return infer_sector_from_name(company_name)
-     
+
     clean_ticker = clean_ticker_for_yf(ticker)
     if clean_ticker in sector_cache:
         return sector_cache[clean_ticker]
-     
+
     try:
         t = yf.Ticker(clean_ticker)
         yf_sector = t.info.get('sector')
@@ -57,21 +76,28 @@ def get_sector_for_ticker(ticker, company_name=""):
     sector_cache[clean_ticker] = fallback_sector
     return fallback_sector
 
+
 TICKER_ALIASES = {
     "LBTY": "LBTYA",
     "GOOG": "GOOGL",
     "BRK.B": "BRK-B",
 }
 
+
 def clean_ticker_for_yf(ticker):
-    if not ticker: return ""
+    if not ticker:
+        return ""
     clean = str(ticker).strip().upper()
     clean = clean.replace('"', '').replace("'", "").replace('(', '').replace(')', '').replace('[', '').replace(']', '')
-    if ":" in clean: clean = clean.split(":")[-1].strip()
+    if ":" in clean:
+        clean = clean.split(":")[-1].strip()
     clean = re.sub(r'[\s]', '', clean)
-    if "," in clean: clean = clean.split(",")[0].strip()
-    elif "/" in clean: clean = clean.split("/")[0].strip()
+    if "," in clean:
+        clean = clean.split(",")[0].strip()
+    elif "/" in clean:
+        clean = clean.split("/")[0].strip()
     return TICKER_ALIASES.get(clean, clean)
+
 
 def assign_market_cap_tier(market_cap_val):
     if not market_cap_val or market_cap_val <= 0:
@@ -83,7 +109,9 @@ def assign_market_cap_tier(market_cap_val):
     else:
         return 'Large', 'SPY'
 
+
 mcap_cache = {}
+
 
 def get_point_in_time_metadata(ticker_symbol, tx_date_str):
     cleaned_ticker = clean_ticker_for_yf(ticker_symbol)
@@ -104,7 +132,7 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
         if hist.empty or 'Close' not in hist.columns:
             mcap_cache[cache_key] = (None, 'Unknown', None)
             return None, 'Unknown', None
-             
+
         hist.index = hist.index.date
         if tx_date in hist.index:
             price = float(hist.loc[tx_date, 'Close'])
@@ -132,7 +160,7 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
 
         historical_mcap = price * shares
         category, benchmark = assign_market_cap_tier(historical_mcap)
-         
+
         result = (historical_mcap, category, benchmark)
         mcap_cache[cache_key] = result
         return result
@@ -140,215 +168,327 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
         mcap_cache[cache_key] = (None, 'Unknown', None)
         return None, 'Unknown', None
 
-def fetch_efts_search_api(start_date_str, end_date_str):
-    url = f"https://efts.sec.gov/LATEST/search-index?q=*&forms=4,4/A&dateRange=custom&startdt={start_date_str}&enddt={end_date_str}"
-    response = None
-    for attempt in range(3):
-        try:
-            response = requests.get(url, headers=HEADERS, timeout=30)
-            if response.status_code == 200:
-                break
-            print(f"EFTS search attempt {attempt + 1} returned status code {response.status_code}")
-        except requests.exceptions.RequestException as e:
-            print(f"EFTS search attempt {attempt + 1} failed ({e}); retrying...")
-            time.sleep(2)
 
-    if not response or response.status_code != 200:
-        print("Failed to fetch filings from SEC EFTS search index.")
+# ---------------------------------------------------------------------------
+# SEC fetching
+# ---------------------------------------------------------------------------
+ATOM = '{http://www.w3.org/2005/Atom}'
+FEED_URL = ("https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4"
+            "&company=&dateb=&owner=include&start={start}&count=100&output=atom")
+
+
+def sec_get(url, retries=3, timeout=20):
+    """GET with retries. Returns the Response on HTTP 200, otherwise None (404 is not retried)."""
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=timeout)
+            if r.status_code == 200:
+                return r
+            print(f"  HTTP {r.status_code} for {url} (attempt {attempt}/{retries})")
+            if r.status_code == 404:
+                return None
+        except requests.exceptions.RequestException as e:
+            print(f"  Request error for {url}: {e} (attempt {attempt}/{retries})")
+        time.sleep(1.5 * attempt)
+    return None
+
+
+def parse_atom(content):
+    """Parse the EDGAR 'current filings' Atom feed into a list of filing dicts."""
+    root = ET.fromstring(content)
+    entries = []
+    for e in root.findall(f'{ATOM}entry'):
+        title = e.findtext(f'{ATOM}title') or ''
+        cat = e.find(f'{ATOM}category')
+        form_type = (cat.get('term') if cat is not None else '') or title.split(' - ')[0]
+        link = e.find(f'{ATOM}link')
+        href = link.get('href', '') if link is not None else ''
+
+        m_acc = re.search(r'(\d{10}-\d{2}-\d{6})', href)
+        m_cik = re.search(r'/data/(\d+)/', href)
+        if not (m_acc and m_cik):
+            continue
+        m_name = re.match(r'^\S+\s*-\s*(.*?)\s*\(\d{10}\)', title)
+        acc = m_acc.group(1)
+        entries.append({
+            'accession_number': acc,
+            'form_type': form_type.strip(),
+            'company': m_name.group(1) if m_name else '',
+            # full submission text file: contains the Form 4 XML, same as the backfill reads
+            'url': f"https://www.sec.gov/Archives/edgar/data/{m_cik.group(1)}/{acc}.txt",
+        })
+    return entries
+
+
+def fetch_live_entries(seen, max_pages=5):
+    """Newest Form 4 / 4/A filings from the Atom feed that we haven't processed yet."""
+    picked = {}
+    for page in range(max_pages):
+        r = sec_get(FEED_URL.format(start=page * 100))
+        if r is None:
+            if page == 0:
+                raise RuntimeError("Could not fetch the EDGAR current-filings feed.")
+            break
+        page_entries = [e for e in parse_atom(r.content) if e['form_type'] in ('4', '4/A')]
+        print(f"  feed page {page + 1}: {len(page_entries)} Form 4 / 4/A entries")
+        if not page_entries:
+            break
+        unknown = [e for e in page_entries if e['accession_number'] not in seen]
+        if not unknown:
+            break  # whole page already processed; older pages will be too
+        for e in unknown:
+            picked.setdefault(e['accession_number'], e)  # each filing shows up twice (issuer + owner)
+        time.sleep(0.2)
+    entries = list(picked.values())
+    entries.reverse()  # oldest first
+    return entries
+
+
+def fetch_daily_entries(day):
+    """All Form 4 / 4/A filings from one day's master index."""
+    qtr = (day.month - 1) // 3 + 1
+    url = f"https://www.sec.gov/Archives/edgar/daily-index/{day.year}/QTR{qtr}/master.{day:%Y%m%d}.idx"
+    r = sec_get(url)
+    if r is None:
+        print(f"No daily index available for {day} (weekend/holiday, or not published yet).")
         return []
+    found = {}
+    for line in r.text.splitlines():
+        parts = line.split('|')
+        if len(parts) == 5 and parts[2] in ('4', '4/A'):
+            filename = parts[4].strip()
+            acc = filename.split('/')[-1].replace('.txt', '')
+            found.setdefault(acc, {
+                'accession_number': acc,
+                'form_type': parts[2],
+                'company': parts[1],
+                'url': f"https://www.sec.gov/Archives/{filename}",
+            })
+    return list(found.values())
+
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+INSERT_QUERY = """
+    INSERT INTO insider_trades (
+        transaction_date, ticker, sector, insider_name, insider_title,
+        shares_bought, shares_owned_following, est_value, activity_type,
+        market_cap, market_cap_category, benchmark_ticker, is_10b51, accession_number, price_at_tx
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT DO NOTHING;
+"""
+
+# A 4/A replaces earlier rows for the same ticker + insider + transaction date
+DELETE_AMENDED_QUERY = """
+    DELETE FROM insider_trades
+    WHERE ticker = %s
+      AND insider_name = %s
+      AND transaction_date = %s
+      AND accession_number IS DISTINCT FROM %s;
+"""
+
+
+def ensure_tables(cursor, conn):
+    # Remembers EVERY filing we've looked at (including ones with no qualifying purchase),
+    # so we never re-download the same filing every 5 minutes.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS etl_processed_filings (
+            accession_number TEXT PRIMARY KEY,
+            form_type TEXT,
+            processed_at TIMESTAMPTZ DEFAULT now()
+        );
+    """)
+    # Keeps the table private from Supabase's public API (your direct DB connection is unaffected)
+    cursor.execute("ALTER TABLE etl_processed_filings ENABLE ROW LEVEL SECURITY;")
+    conn.commit()
+
+
+def get_seen_accessions(cursor):
+    cursor.execute("SELECT accession_number FROM insider_trades WHERE accession_number IS NOT NULL;")
+    seen = {row[0] for row in cursor.fetchall()}
+    cursor.execute("SELECT accession_number FROM etl_processed_filings;")
+    seen |= {row[0] for row in cursor.fetchall()}
+    print(f"Loaded {len(seen)} already-processed accession numbers.")
+    return seen
+
+
+def mark_processed(cursor, acc, form_type):
+    cursor.execute(
+        "INSERT INTO etl_processed_filings (accession_number, form_type) VALUES (%s, %s) "
+        "ON CONFLICT DO NOTHING;", (acc, form_type))
+
+
+# ---------------------------------------------------------------------------
+# Parsing + processing
+# ---------------------------------------------------------------------------
+def safe_float(s):
+    try:
+        return float(s) if s else 0.0
+    except ValueError:
+        return 0.0
+
+
+def extract_purchases(root):
+    """Open-market purchases (code P, acquired A), combined per transaction date.
+
+    Insiders often buy in many small lots on one day; each lot is its own line on the form.
+    Summing per date means a $400k day isn't thrown away because every lot was under $50k.
+    """
+    agg = {}
+    for tx in root.findall(".//nonDerivativeTransaction"):
+        code = tx.findtext(".//transactionCoding/transactionCode")
+        acquired = tx.findtext(".//transactionAmounts/transactionAcquiredDisposedCode/value")
+        if code != 'P' or acquired != 'A':
+            continue
+        tx_date = (tx.findtext(".//transactionDate/value") or "").strip()[:10]
+        if not tx_date:
+            continue
+        shares = safe_float(tx.findtext(".//transactionShares/value"))
+        price = safe_float(tx.findtext(".//transactionPricePerShare/value"))
+        owned = safe_float(tx.findtext(".//sharesOwnedFollowingTransaction/value"))
+        a = agg.setdefault(tx_date, {'shares': 0.0, 'value': 0.0, 'owned': 0.0})
+        a['shares'] += shares
+        a['value'] += shares * price
+        a['owned'] = owned  # holdings after the last lot of the day
+    return agg
+
+
+def process_filing(entry, seen, cursor, conn, stats):
+    acc = entry['accession_number']
+    form_type = entry['form_type']
+    is_amendment = form_type == '4/A'
+
+    time.sleep(0.12)  # stay under SEC's 10 requests/sec limit
+    res = sec_get(entry['url'], retries=2)
+    if res is None:
+        stats['retry'] += 1  # not marked processed -> tried again next run
+        return
+
+    def done(stat):
+        mark_processed(cursor, acc, form_type)
+        conn.commit()
+        seen.add(acc)
+        stats[stat] += 1
+
+    text = res.text
+    low = text.lower()
+    s, e = low.find("<xml>"), low.find("</xml>")
+    if s == -1 or e == -1:
+        return done('no_xml')
+
+    xml_content = re.sub(r'^\s*<\?xml[^>]*\?>', '', text[s + 5:e].strip())
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError as pe:
+        print(f"  bad XML in {acc}: {pe}")
+        return done('bad_xml')
+
+    ticker = "NONE"
+    for tag in [".//issuerTradingSymbol", ".//tradingSymbol", ".//symbol"]:
+        cleaned = clean_ticker_for_yf(root.findtext(tag))
+        if cleaned and re.match(r'^[A-Z\-\.]{1,6}$', cleaned):
+            ticker = cleaned
+            break
+    if ticker in ('NONE', '[NONE]', 'UNKNOWN', 'N/A') or (len(ticker) == 5 and ticker.endswith('X')):
+        return done('no_ticker')
+
+    purchases = extract_purchases(root)
+    if not purchases:
+        return done('no_purchase')
+
+    owner = root.find(".//reportingOwner")
+    insider = ((owner.findtext(".//rptOwnerName") if owner is not None else None) or "UNKNOWN").strip()
+    title = ((owner.findtext(".//officerTitle") if owner is not None else None) or "Director/Other").strip()
+
+    remarks = (root.findtext(".//remarks") or "").upper()
+    is_10b51 = ("10B5-1" in remarks or "10B51" in remarks
+                or (root.findtext(".//aff10b5One") or "").strip().lower() in ("1", "true"))
+
+    qualifying = {d: a for d, a in purchases.items() if a['value'] >= MIN_VALUE}
+    rows = []
+    if qualifying:
+        sector = get_sector_for_ticker(ticker, entry['company'])  # slow yfinance call: only when needed
+        for tx_date, a in sorted(qualifying.items()):
+            mcap, category, benchmark = get_point_in_time_metadata(ticker, tx_date)
+            avg_price = a['value'] / a['shares'] if a['shares'] else 0.0
+            rows.append((tx_date, ticker, sector, insider, title, a['shares'], a['owned'], a['value'],
+                         "Purchase", float(mcap) if mcap else None, category, benchmark, is_10b51,
+                         acc, avg_price))
+
+    if not rows and not is_amendment:
+        return done('below_threshold')
 
     try:
-        data = response.json()
-        hits = data.get('hits', {}).get('hits', [])
-        form4_entries = []
+        replaced = 0
+        if is_amendment:
+            # delete + insert happen in ONE transaction, so a failure can't leave the row deleted
+            for tx_date in purchases:
+                cursor.execute(DELETE_AMENDED_QUERY, (ticker, insider, tx_date, acc))
+                replaced += cursor.rowcount
+        inserted = 0
+        for row in rows:
+            cursor.execute(INSERT_QUERY, row)
+            inserted += cursor.rowcount
+        mark_processed(cursor, acc, form_type)
+        conn.commit()
+    except Exception as db_err:
+        conn.rollback()
+        stats['db_errors'] += 1
+        print(f"*** DATABASE ERROR on {ticker} ({acc}): {db_err}")
+        return
 
-        for hit in hits:
-            src = hit.get('_source', {})
-            form_type = src.get('form', '')
-            if form_type not in ('4', '4/A'):
-                continue
+    seen.add(acc)
+    stats['inserted'] += inserted
+    stats['replaced'] += replaced
+    stats['examined'] += 1
+    for row in rows:
+        print(f"*** {form_type} {ticker}: {insider} bought ${row[7]:,.0f} on {row[0]} ({acc})")
+    if is_amendment and replaced:
+        print(f"    amendment replaced {replaced} earlier row(s)")
 
-            file_date = src.get('file_date', '')
-            if not (start_date_str <= file_date <= end_date_str):
-                continue
 
-            _id = hit.get('_id', '')
-            if ':' in _id:
-                filename = _id.split(':', 1)[1]
-            else:
-                continue
+def main():
+    args = sys.argv[1:]
+    mode = args[0].lower() if args else 'live'
+    now_et = datetime.now(EASTERN)
+    print(f"[{now_et:%Y-%m-%d %H:%M:%S} ET] ETL starting, mode={mode}")
 
-            display_names = src.get('display_names', [])
-            company = display_names[0] if display_names else 'UNKNOWN'
-            accession_dash = filename.split('/')[-1].replace('.txt', '')
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    ensure_tables(cursor, conn)
+    seen = get_seen_accessions(cursor)
 
-            form4_entries.append({
-                'company': company,
-                'form_type': form_type,
-                'date_filed': file_date,
-                'filename': filename,
-                'accession_number': accession_dash
-            })
+    if mode == 'daily':
+        day = (datetime.strptime(args[1], '%Y-%m-%d').date() if len(args) > 1
+               else (now_et - timedelta(days=1)).date())
+        print(f"Daily sweep for {day}")
+        entries = [e for e in fetch_daily_entries(day) if e['accession_number'] not in seen]
+    elif mode == 'live':
+        entries = fetch_live_entries(seen)
+    else:
+        sys.exit("Usage: python etl.py [live | daily [YYYY-MM-DD]]")
 
-        print(f"Successfully fetched {len(form4_entries)} Form 4 entries for range {start_date_str} to {end_date_str} via EFTS index.")
-        return form4_entries
-    except Exception as e:
-        print(f"Error parsing EFTS JSON response: {e}")
-        return []
+    entries.sort(key=lambda e: e['form_type'] == '4/A')  # originals before amendments
+    print(f"{len(entries)} new filings to examine.")
 
-def get_existing_accessions(cursor):
-    cursor.execute("SELECT accession_number FROM insider_trades WHERE accession_number IS NOT NULL;")
-    accessions = {row[0] for row in cursor.fetchall()}
-    print(f"Loaded {len(accessions)} existing accession numbers from Supabase.")
-    return accessions
-
-def process_entries(entries, existing_accessions, cursor, conn):
-    insert_query = """
-        INSERT INTO insider_trades (
-            transaction_date, ticker, sector, insider_name, insider_title, 
-            shares_bought, shares_owned_following, est_value, activity_type,
-            market_cap, market_cap_category, benchmark_ticker, is_10b51, accession_number, price_at_tx
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (accession_number) DO NOTHING;
-    """
-
-    delete_amended_query = """
-        DELETE FROM insider_trades
-        WHERE ticker = %s
-          AND insider_name = %s
-          AND transaction_date = %s
-          AND accession_number IS DISTINCT FROM %s;
-    """
-
-    inserted_count = 0
-    for idx, entry in enumerate(entries):
-        acc_num = entry['accession_number']
-        if acc_num in existing_accessions and entry.get('form_type') != '4/A':
-            continue
-
-        txt_url = f"https://www.sec.gov/Archives/{entry['filename']}"
-        time.sleep(0.12)  # Respect SEC rate limits
-         
+    stats = {k: 0 for k in ('examined', 'inserted', 'replaced', 'retry', 'no_xml', 'bad_xml', 'no_ticker',
+                            'no_purchase', 'below_threshold', 'db_errors', 'errors')}
+    for entry in entries:
         try:
-            res = requests.get(txt_url, headers=HEADERS, timeout=15)
-            if res.status_code != 200:
-                continue
-                 
-            text_lower = res.text.lower()
-            xml_start = text_lower.find("<xml>")
-            xml_end = text_lower.find("</xml>")
-            if xml_start == -1 or xml_end == -1:
-                continue
-                 
-            xml_content = res.text[xml_start+5:xml_end].strip()
-            root = ET.fromstring(xml_content)
-             
-            ticker = "NONE"
-            for tag in [".//issuerTradingSymbol", ".//tradingSymbol", ".//symbol"]:
-                found = root.findtext(tag)
-                cleaned_found = clean_ticker_for_yf(found)
-                if cleaned_found and re.match(r'^[A-Z\-\.]{1,6}$', cleaned_found):
-                    ticker = cleaned_found
-                    break
-             
-            if not ticker or ticker in ['NONE', '[NONE]', 'UNKNOWN', 'N/A'] or (len(ticker) == 5 and ticker.endswith('X')):
-                continue
+            process_filing(entry, seen, cursor, conn, stats)
+        except Exception as ex:
+            conn.rollback()
+            stats['errors'] += 1
+            print(f"  error on {entry['accession_number']}: {type(ex).__name__}: {ex}")
 
-            company_name = entry.get('company', '')
-            sector = get_sector_for_ticker(ticker, company_name)
-             
-            owners = root.findall(".//reportingOwner")
-            if not owners:
-                owners = [root]
+    cursor.close()
+    conn.close()
+    print(f"--- Done. {stats} ---")
+    if stats['db_errors']:
+        sys.exit(1)  # make the GitHub run turn red instead of silently 'succeeding'
 
-            for owner in owners:
-                insider = owner.findtext(".//rptOwnerName") or "UNKNOWN"
-                title = owner.findtext(".//officerTitle") or "Director/Other"
-                 
-                for tx in root.findall(".//nonDerivativeTransaction"):
-                    code = tx.findtext(".//transactionCoding/transactionCode")
-                    acquired = tx.findtext(".//transactionAmounts/transactionAcquiredDisposedCode/value")
-                     
-                    if code == 'P' and acquired == 'A':
-                        tx_date = tx.findtext(".//transactionDate/value")
-                        if not tx_date:
-                            continue
-                             
-                        shares_str = tx.findtext(".//transactionShares/value")
-                        shares = float(shares_str) if shares_str else 0.0
-                        
-                        price_str = tx.findtext(".//transactionPricePerShare/value")
-                        price = float(price_str) if price_str else 0.0
-                        
-                        est_val = shares * price
-                        if est_val < 50000:
-                            continue
-                             
-                        owned_str = tx.findtext(".//sharesOwnedFollowingTransaction/value")
-                        owned = float(owned_str) if owned_str else 0.0
-
-                        remark_text = (root.findtext(".//remarks") or "").upper()
-                        is_10b51 = "10B5-1" in remark_text or "10B51" in remark_text
-                         
-                        mcap, category, benchmark = get_point_in_time_metadata(ticker, tx_date)
-                         
-                        try:
-                            if entry.get('form_type') == '4/A':
-                                cursor.execute(delete_amended_query, (
-                                    ticker, insider, tx_date, acc_num
-                                ))
-
-                            cursor.execute(insert_query, (
-                                tx_date, ticker, sector, insider, title, shares, owned, est_val, "Purchase",
-                                float(mcap) if mcap else None, category, benchmark, is_10b51, acc_num, price
-                            ))
-                            conn.commit()
-                            inserted_count += 1
-                            existing_accessions.add(acc_num)
-                            print(f"*** SUCCESS: Inserted {ticker} trade (${est_val:,.2f}) into Supabase! ***")
-                        except Exception as db_err:
-                            conn.rollback()
-                            print(f"*** DATABASE ERROR inserting {ticker}: {db_err} ***")
-        except Exception:
-            continue
-            
-    return inserted_count
 
 if __name__ == "__main__":
-    import sys
-    
-    # Use Eastern Time for proper day calculation so real-time cron jobs don't roll over prematurely in UTC
-    eastern = timezone('US/Eastern') if 'timezone' in globals() else None
-    try:
-        from pytz import timezone
-        eastern = timezone('US/Eastern')
-        today_str = datetime.now(eastern).strftime('%Y-%m-%d')
-        yesterday_str = (datetime.now(eastern) - timedelta(days=1)).strftime('%Y-%m-%d')
-    except Exception:
-        today_str = datetime.utcnow().strftime('%Y-%m-%d')
-        yesterday_str = (datetime.utcnow() - timedelta(days=1)).strftime('%Y-%m-%d')
-
-    # If an argument is provided, use it as start date; otherwise look back across yesterday and today to catch real-time filings safely
-    if len(sys.argv) > 1 and sys.argv[1].strip():
-        start_date = sys.argv[1].strip()
-        end_date = sys.argv[2].strip() if len(sys.argv) > 2 else today_str
-    else:
-        start_date = yesterday_str
-        end_date = today_str
-    
-    try:
-        print(f"[{datetime.now()}] Running ETL execution for date range: {start_date} to {end_date}")
-        entries = fetch_efts_search_api(start_date, end_date)
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        existing_accessions = get_existing_accessions(cursor)
-        
-        inserted = process_entries(entries, existing_accessions, cursor, conn)
-        
-        cursor.close()
-        conn.close()
-        print(f"--- Execution complete. Inserted {inserted} new trades. ---")
-    except Exception as e:
-        print(f"Error in ETL execution: {e}")
+    main()
