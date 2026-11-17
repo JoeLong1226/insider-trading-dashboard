@@ -139,69 +139,6 @@ def get_point_in_time_metadata(ticker_symbol, tx_date_str):
         mcap_cache[cache_key] = (None, 'Unknown', None)
         return None, 'Unknown', None
 
-def fetch_live_sec_rss():
-    url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&output=atom"
-    response = None
-    
-    print("Sending request to SEC RSS feed...")
-    for attempt in range(3):
-        try:
-            response = requests.get(url, headers=HEADERS, timeout=45)
-            print(f"Attempt {attempt + 1} Status Code: {response.status_code}")
-            if response.status_code == 200:
-                break
-        except requests.exceptions.RequestException as e:
-            print(f"Attempt {attempt + 1} Request Exception: {e}")
-            time.sleep(3)
-
-    if not response or response.status_code != 200:
-        status = response.status_code if response else 'No Response'
-        print(f"FAILED to fetch SEC RSS feed. Final Status: {status}")
-        return []
-    
-    try:
-        root = ET.fromstring(response.content)
-        ns = {'atom': 'http://www.w3.org/2005/Atom'}
-        entries = []
-
-        for entry in root.findall('atom:entry', ns):
-            title = entry.findtext('atom:title', default='', namespaces=ns)
-            if '4' not in title.upper():
-                continue
-
-            updated = entry.findtext('atom:updated', default='', namespaces=ns)
-            link_el = entry.find('atom:link', namespaces=ns)
-            href = link_el.get('href') if link_el is not None else ''
-            
-            if not href or 'edgar/data/' not in href:
-                continue
-
-            if href.endswith('-index.htm'):
-                base_path = href.replace('-index.htm', '')
-                filename = f"{base_path.lstrip('/')}.txt"
-            elif 'edgar/data/' in href:
-                clean_href = href.split('?')[0]
-                if clean_href.endswith('.htm'):
-                    clean_href = clean_href.rsplit('/', 1)[0]
-                filename = f"{clean_href.lstrip('/')}.txt"
-            else:
-                continue
-
-            form_type = '4/A' if '4/A' in title.upper() or 'AMENDMENT' in title.upper() else '4'
-
-            entries.append({
-                'company': title.split(' - ')[0] if ' - ' in title else 'UNKNOWN',
-                'form_type': form_type,
-                'date_filed': updated[:10],
-                'filename': filename,
-                'accession_number': filename.split('/')[-1].replace('.txt', '')
-            })
-        print(f"Successfully parsed {len(entries)} Form 4 entries from live RSS feed.")
-        return entries
-    except Exception as e:
-        print(f"Error parsing SEC RSS XML content: {e}")
-        return []
-
 def fetch_efts_search_api(target_date_str):
     url = f"https://efts.sec.gov/LATEST/search-index?q=*&forms=4,4/A&dateRange=custom&startdt={target_date_str}&enddt={target_date_str}"
     response = None
@@ -210,47 +147,59 @@ def fetch_efts_search_api(target_date_str):
             response = requests.get(url, headers=HEADERS, timeout=30)
             if response.status_code == 200:
                 break
-        except requests.exceptions.RequestException:
+            print(f"EFTS search attempt {attempt + 1} returned status code {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"EFTS search attempt {attempt + 1} failed ({e}); retrying...")
             time.sleep(2)
 
     if not response or response.status_code != 200:
+        print("Failed to fetch filings from SEC EFTS search index.")
         return []
 
-    data = response.json()
-    hits = data.get('hits', {}).get('hits', [])
-    form4_entries = []
+    try:
+        data = response.json()
+        hits = data.get('hits', {}).get('hits', [])
+        form4_entries = []
 
-    for hit in hits:
-        src = hit.get('_source', {})
-        form_type = src.get('form', '')
-        if form_type not in ('4', '4/A'):
-            continue
+        for hit in hits:
+            src = hit.get('_source', {})
+            form_type = src.get('form', '')
+            if form_type not in ('4', '4/A'):
+                continue
 
-        file_date = src.get('file_date', '')
-        if file_date != target_date_str:
-            continue
+            file_date = src.get('file_date', '')
+            if file_date != target_date_str:
+                continue
 
-        _id = hit.get('_id', '')
-        if ':' in _id:
-            filename = _id.split(':', 1)[1]
-        else:
-            continue
+            _id = hit.get('_id', '')
+            if ':' in _id:
+                filename = _id.split(':', 1)[1]
+            else:
+                continue
 
-        accession_dash = filename.split('/')[-1].replace('.txt', '')
+            display_names = src.get('display_names', [])
+            company = display_names[0] if display_names else 'UNKNOWN'
+            accession_dash = filename.split('/')[-1].replace('.txt', '')
 
-        form4_entries.append({
-            'company': src.get('display_names', [''])[0],
-            'form_type': form_type,
-            'date_filed': file_date,
-            'filename': filename,
-            'accession_number': accession_dash
-        })
+            form4_entries.append({
+                'company': company,
+                'form_type': form_type,
+                'date_filed': file_date,
+                'filename': filename,
+                'accession_number': accession_dash
+            })
 
-    return form4_entries
+        print(f"Successfully fetched {len(form4_entries)} Form 4 entries for {target_date_str} via EFTS index.")
+        return form4_entries
+    except Exception as e:
+        print(f"Error parsing EFTS JSON response: {e}")
+        return []
 
 def get_existing_accessions(cursor):
     cursor.execute("SELECT accession_number FROM insider_trades WHERE accession_number IS NOT NULL;")
-    return {row[0] for row in cursor.fetchall()}
+    accessions = {row[0] for row in cursor.fetchall()}
+    print(f"Loaded {len(accessions)} existing accession numbers from Supabase.")
+    return accessions
 
 def process_entries(entries, existing_accessions, cursor, conn):
     insert_query = """
@@ -278,16 +227,19 @@ def process_entries(entries, existing_accessions, cursor, conn):
             continue
 
         txt_url = f"https://www.sec.gov/Archives/{entry['filename']}"
-        time.sleep(0.12)  
+        time.sleep(0.12)  # Respect SEC rate limits
          
         try:
             res = requests.get(txt_url, headers=HEADERS, timeout=15)
-            if res.status_code != 200 or "<xml>" not in res.text.lower():
+            if res.status_code != 200:
+                print(f"[{idx+1}/{len(entries)}] Skipped {acc_num}: HTTP status {res.status_code}")
                 continue
                  
-            xml_start = res.text.find("<XML>")
-            xml_end = res.text.find("</XML>")
+            text_lower = res.text.lower()
+            xml_start = text_lower.find("<xml>")
+            xml_end = text_lower.find("</xml>")
             if xml_start == -1 or xml_end == -1:
+                print(f"[{idx+1}/{len(entries)}] Skipped {acc_num}: XML tags not found.")
                 continue
                  
             xml_content = res.text[xml_start+5:xml_end].strip()
@@ -302,6 +254,7 @@ def process_entries(entries, existing_accessions, cursor, conn):
                     break
              
             if not ticker or ticker in ['NONE', '[NONE]', 'UNKNOWN', 'N/A'] or (len(ticker) == 5 and ticker.endswith('X')):
+                print(f"[{idx+1}/{len(entries)}] Skipped {acc_num}: Invalid ticker ({ticker}).")
                 continue
 
             company_name = entry.get('company', '')
@@ -334,6 +287,7 @@ def process_entries(entries, existing_accessions, cursor, conn):
                         print(f"-> Found Purchase: {ticker} | Insider: {insider} | Value: ${est_val:,.2f}")
                         
                         if est_val < 50000:
+                            print(f"   Skipped: Value ${est_val:,.2f} is under $50k threshold.")
                             continue
                              
                         owned_str = tx.findtext(".//sharesOwnedFollowingTransaction/value")
@@ -360,48 +314,31 @@ def process_entries(entries, existing_accessions, cursor, conn):
                             print(f"*** SUCCESS: Inserted {ticker} trade (${est_val:,.2f}) into Supabase! ***")
                         except Exception as db_err:
                             conn.rollback()
-        except Exception:
+                            print(f"*** DATABASE ERROR inserting {ticker}: {db_err} ***")
+        except Exception as parse_err:
+            print(f"[{idx+1}/{len(entries)}] Error parsing filing {acc_num}: {parse_err}")
             continue
             
     return inserted_count
 
-def run_realtime_poll():
-    print(f"[{datetime.now()}] Polling live SEC RSS feed...")
-    entries = fetch_live_sec_rss()
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    existing_accessions = get_existing_accessions(cursor)
-    
-    inserted = process_entries(entries, existing_accessions, cursor, conn)
-    
-    cursor.close()
-    conn.close()
-    print(f"--- Live Poll complete. Inserted {inserted} new trades. ---")
-
-def run_nightly_audit(target_date_str):
-    print(f"[{datetime.now()}] Running reconciliation audit for {target_date_str}...")
-    entries = fetch_efts_search_api(target_date_str)
-    print(f"Found {len(entries)} total filings via EFTS search index for audit date.")
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    existing_accessions = get_existing_accessions(cursor)
-
-    inserted = process_entries(entries, existing_accessions, cursor, conn)
-
-    cursor.close()
-    conn.close()
-    print(f"--- Audit complete. Reconciled and inserted {inserted} missing trades. ---")
-
 if __name__ == "__main__":
     import sys
-    # If you pass 'audit YYYY-MM-DD', it runs the full historical search index sweep for that day.
-    # Otherwise, it runs the live RSS feed poll.
-    if len(sys.argv) >= 3 and sys.argv[1].strip() == 'audit':
-        run_nightly_audit(sys.argv[2].strip())
-    else:
-        try:
-            run_realtime_poll()
-        except Exception as e:
-            print(f"Error in live poll execution: {e}")
+    # Usage: python etl.py [YYYY-MM-DD]
+    # If no date argument is provided, it defaults to today's date.
+    target_date = sys.argv[1].strip() if len(sys.argv) > 1 else datetime.utcnow().strftime('%Y-%m-%d')
+    
+    try:
+        print(f"[{datetime.now()}] Running ETL execution for date: {target_date}")
+        entries = fetch_efts_search_api(target_date)
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        existing_accessions = get_existing_accessions(cursor)
+        
+        inserted = process_entries(entries, existing_accessions, cursor, conn)
+        
+        cursor.close()
+        conn.close()
+        print(f"--- Execution complete. Inserted {inserted} new trades. ---")
+    except Exception as e:
+        print(f"Error in ETL execution: {e}")
