@@ -5,6 +5,9 @@ Usage:
   python etl.py                      # live mode: poll EDGAR's "latest filings" Atom feed
   python etl.py daily                # catch-up sweep of yesterday (ET) from the daily index
   python etl.py daily START [END]    # sweep every weekday from START to END (YYYY-MM-DD); END defaults to START
+
+Daily/range sweeps are "fill the gaps" runs: before inserting, they check whether a row for the same
+ticker + insider + transaction date already exists (e.g. from your backfill) and skip it if so.
 """
 import os
 import re
@@ -291,6 +294,14 @@ DELETE_AMENDED_QUERY = """
 """
 
 
+# Used by daily/range sweeps only: don't re-insert something that is already in the table
+EXISTS_QUERY = """
+    SELECT 1 FROM insider_trades
+    WHERE ticker = %s AND insider_name = %s AND transaction_date = %s
+    LIMIT 1;
+"""
+
+
 def ensure_tables(cursor, conn):
     # Remembers EVERY filing we've looked at (including ones with no qualifying purchase),
     # so we never re-download the same filing every 5 minutes.
@@ -356,7 +367,7 @@ def extract_purchases(root):
     return agg
 
 
-def process_filing(entry, seen, cursor, conn, stats):
+def process_filing(entry, seen, cursor, conn, stats, guard=False):
     acc = entry['accession_number']
     form_type = entry['form_type']
     is_amendment = form_type == '4/A'
@@ -429,9 +440,18 @@ def process_filing(entry, seen, cursor, conn, stats):
                 cursor.execute(DELETE_AMENDED_QUERY, (ticker, insider, tx_date, acc))
                 replaced += cursor.rowcount
         inserted = 0
+        already = 0
+        new_rows = []
         for row in rows:
+            if guard:
+                cursor.execute(EXISTS_QUERY, (ticker, insider, row[0]))
+                if cursor.fetchone():
+                    already += 1
+                    continue
             cursor.execute(INSERT_QUERY, row)
             inserted += cursor.rowcount
+            if cursor.rowcount:
+                new_rows.append(row)
         mark_processed(cursor, acc, form_type)
         conn.commit()
     except Exception as db_err:
@@ -443,19 +463,20 @@ def process_filing(entry, seen, cursor, conn, stats):
     seen.add(acc)
     stats['inserted'] += inserted
     stats['replaced'] += replaced
+    stats['already_have'] += already
     stats['examined'] += 1
-    for row in rows:
+    for row in new_rows:
         print(f"*** {form_type} {ticker}: {insider} bought ${row[7]:,.0f} on {row[0]} ({acc})")
     if is_amendment and replaced:
         print(f"    amendment replaced {replaced} earlier row(s)")
 
 
-def run_batch(entries, seen, cursor, conn, stats):
+def run_batch(entries, seen, cursor, conn, stats, guard=False):
     entries.sort(key=lambda e: e['form_type'] == '4/A')  # originals before amendments
     print(f"{len(entries)} new filings to examine.")
     for entry in entries:
         try:
-            process_filing(entry, seen, cursor, conn, stats)
+            process_filing(entry, seen, cursor, conn, stats, guard)
         except Exception as ex:
             conn.rollback()
             stats['errors'] += 1
@@ -485,7 +506,7 @@ def main():
     ensure_tables(cursor, conn)
     seen = get_seen_accessions(cursor)
 
-    stats = {k: 0 for k in ('examined', 'inserted', 'replaced', 'retry', 'no_xml', 'bad_xml', 'no_ticker',
+    stats = {k: 0 for k in ('examined', 'inserted', 'already_have', 'replaced', 'retry', 'no_xml', 'bad_xml', 'no_ticker',
                             'no_purchase', 'below_threshold', 'db_errors', 'errors')}
 
     if mode == 'live':
@@ -500,7 +521,7 @@ def main():
         for day in days:
             print(f"=== Daily sweep for {day} ===")
             entries = [e for e in fetch_daily_entries(day) if e['accession_number'] not in seen]
-            run_batch(entries, seen, cursor, conn, stats)
+            run_batch(entries, seen, cursor, conn, stats, guard=True)
 
     cursor.close()
     conn.close()
