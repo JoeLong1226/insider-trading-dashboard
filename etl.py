@@ -3,7 +3,8 @@ Live Form 4 ETL: SEC EDGAR -> Supabase (insider_trades)
 
 Usage:
   python etl.py                      # live mode: poll EDGAR's "latest filings" Atom feed
-  python etl.py daily [YYYY-MM-DD]   # catch-up sweep from the daily index (default: yesterday, ET)
+  python etl.py daily                # catch-up sweep of yesterday (ET) from the daily index
+  python etl.py daily START [END]    # sweep every weekday from START to END (YYYY-MM-DD); END defaults to START
 """
 import os
 import re
@@ -220,7 +221,7 @@ def parse_atom(content):
     return entries
 
 
-def fetch_live_entries(seen, max_pages=5):
+def fetch_live_entries(seen, max_pages=10):
     """Newest Form 4 / 4/A filings from the Atom feed that we haven't processed yet."""
     picked = {}
     for page in range(max_pages):
@@ -449,32 +450,9 @@ def process_filing(entry, seen, cursor, conn, stats):
         print(f"    amendment replaced {replaced} earlier row(s)")
 
 
-def main():
-    args = sys.argv[1:]
-    mode = args[0].lower() if args else 'live'
-    now_et = datetime.now(EASTERN)
-    print(f"[{now_et:%Y-%m-%d %H:%M:%S} ET] ETL starting, mode={mode}")
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    ensure_tables(cursor, conn)
-    seen = get_seen_accessions(cursor)
-
-    if mode == 'daily':
-        day = (datetime.strptime(args[1], '%Y-%m-%d').date() if len(args) > 1
-               else (now_et - timedelta(days=1)).date())
-        print(f"Daily sweep for {day}")
-        entries = [e for e in fetch_daily_entries(day) if e['accession_number'] not in seen]
-    elif mode == 'live':
-        entries = fetch_live_entries(seen)
-    else:
-        sys.exit("Usage: python etl.py [live | daily [YYYY-MM-DD]]")
-
+def run_batch(entries, seen, cursor, conn, stats):
     entries.sort(key=lambda e: e['form_type'] == '4/A')  # originals before amendments
     print(f"{len(entries)} new filings to examine.")
-
-    stats = {k: 0 for k in ('examined', 'inserted', 'replaced', 'retry', 'no_xml', 'bad_xml', 'no_ticker',
-                            'no_purchase', 'below_threshold', 'db_errors', 'errors')}
     for entry in entries:
         try:
             process_filing(entry, seen, cursor, conn, stats)
@@ -482,6 +460,47 @@ def main():
             conn.rollback()
             stats['errors'] += 1
             print(f"  error on {entry['accession_number']}: {type(ex).__name__}: {ex}")
+
+
+def weekdays_between(start, end):
+    days, d = [], start
+    while d <= end:
+        if d.weekday() < 5:  # EDGAR takes no filings on weekends
+            days.append(d)
+        d += timedelta(days=1)
+    return days
+
+
+def main():
+    args = sys.argv[1:]
+    mode = args[0].lower() if args else 'live'
+    now_et = datetime.now(EASTERN)
+    print(f"[{now_et:%Y-%m-%d %H:%M:%S} ET] ETL starting, mode={mode}")
+
+    if mode not in ('live', 'daily'):
+        sys.exit("Usage: python etl.py [live | daily [START [END]]]")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    ensure_tables(cursor, conn)
+    seen = get_seen_accessions(cursor)
+
+    stats = {k: 0 for k in ('examined', 'inserted', 'replaced', 'retry', 'no_xml', 'bad_xml', 'no_ticker',
+                            'no_purchase', 'below_threshold', 'db_errors', 'errors')}
+
+    if mode == 'live':
+        run_batch(fetch_live_entries(seen), seen, cursor, conn, stats)
+    else:
+        if len(args) > 1 and args[1].strip():
+            start = datetime.strptime(args[1].strip(), '%Y-%m-%d').date()
+            end = datetime.strptime(args[2].strip(), '%Y-%m-%d').date() if len(args) > 2 and args[2].strip() else start
+            days = weekdays_between(start, end)
+        else:
+            days = [(now_et - timedelta(days=1)).date()]
+        for day in days:
+            print(f"=== Daily sweep for {day} ===")
+            entries = [e for e in fetch_daily_entries(day) if e['accession_number'] not in seen]
+            run_batch(entries, seen, cursor, conn, stats)
 
     cursor.close()
     conn.close()
