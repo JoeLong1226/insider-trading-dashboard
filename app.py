@@ -19,7 +19,7 @@ def get_db_connection():
     return psycopg2.connect(conn_url)
 
 
-@st.cache_data(ttl=86400)  # Cache sector lookups for 24 hours
+@st.cache_data(ttl=86400)
 def get_stock_sector(ticker):
     if not ticker or ticker.upper() in ["UNKNOWN", "NONE", "NULL", "N/A"]:
         return "Unclassified"
@@ -43,7 +43,7 @@ def get_stock_sector(ticker):
     return "Unclassified"
 
 
-@st.cache_data(ttl=86400)  # Cache benchmark & stock performance
+@st.cache_data(ttl=86400)
 def calculate_trade_performance(
     ticker, benchmark_ticker, tx_date_str, shares, est_value_db
 ):
@@ -135,10 +135,7 @@ def calculate_trade_performance(
 
 
 def process_advanced_conviction_metrics(df):
-    """Institutional Conviction Score Architecture v2.2.
-
-    Balanced scoring with detailed sub-score logging for transparent audit trails.
-    """
+    """Institutional Conviction Score Architecture v2.2."""
     df["parsed_date"] = pd.to_datetime(df["transaction_date"].astype(str).str[:10])
     df = df.sort_values(by="parsed_date", ascending=True).reset_index(drop=True)
 
@@ -157,16 +154,14 @@ def process_advanced_conviction_metrics(df):
         market_cap = float(row["market_cap"]) if pd.notnull(row["market_cap"]) else 0.0
         price_30d = float(row.get("price_30d_change_pct", 0.0) or 0.0)
 
-        # 1. Relative Personal Commitment (% Position Increase)
         prior_shares = shares_following - shares_bought
         if prior_shares > 0 and shares_bought > 0:
             position_increase_pct = (shares_bought / prior_shares) * 100.0
         elif shares_bought > 0 and prior_shares <= 0:
-            position_increase_pct = 100.0  # New position initiation
+            position_increase_pct = 100.0
         else:
             position_increase_pct = 0.0
 
-        # 2. Multi-Insider Consensus (Rolling 30-day Window)
         window_df = df[
             (df["ticker"] == ticker)
             & (df["parsed_date"] >= current_date - pd.Timedelta(days=30))
@@ -182,17 +177,15 @@ def process_advanced_conviction_metrics(df):
 
         distinct_all_insiders = window_df["insider_name"].nunique()
 
-        # 3. Role Categorization
         is_tier1 = any(
             t in title for t in ["CEO", "CFO", "COO", "CHIEF EXECUTIVE", "CHIEF FINANCIAL", "CHIEF OPERATING"]
         )
         is_tier2 = any(t in title for t in ["PRESIDENT", "VP", "VICE PRESIDENT"]) and not is_tier1
         is_admin_or_other = any(t in title for t in ["ACCOUNTING", "SECRETARY", "COUNSEL", "SEE REMARKS"])
 
-        score = 10  # Base score
+        score = 10
         breakdown = ["Base: 10"]
 
-        # Factor A: Market Cap Adjustment
         if 0 < market_cap < 50000000:
             score -= 10
             breakdown.append("Micro-cap penalty: -10")
@@ -200,7 +193,6 @@ def process_advanced_conviction_metrics(df):
             score += 10
             breakdown.append("Stability bonus: +10")
 
-        # Factor B: Operational Role Weighting
         if is_tier1:
             score += 20
             breakdown.append("C-Suite role (CEO/CFO/COO): +20")
@@ -214,7 +206,6 @@ def process_advanced_conviction_metrics(df):
             score += 8
             breakdown.append("Standard Director/Officer: +8")
 
-        # Factor C: Relative Personal Stake Expansion
         if position_increase_pct >= 100.0:
             score += 25
             breakdown.append(f"Position doubled ({position_increase_pct:.1f}%): +25")
@@ -225,7 +216,6 @@ def process_advanced_conviction_metrics(df):
             score += 8
             breakdown.append(f"Position increased 10%+ ({position_increase_pct:.1f}%): +8")
 
-        # Factor D: Absolute Dollar Commitment
         if est_val >= 500000:
             score += 15
             breakdown.append("Large $500k+ purchase: +15")
@@ -233,7 +223,6 @@ def process_advanced_conviction_metrics(df):
             score += 8
             breakdown.append("Substantial $100k+ purchase: +8")
 
-        # Factor E: Multi-Insider Consensus Bonus
         if distinct_csuite_insiders >= 2:
             score += 30
             breakdown.append("C-Suite Cluster Consensus: +30")
@@ -244,7 +233,6 @@ def process_advanced_conviction_metrics(df):
             score += 10
             breakdown.append("Multi-Insider Buy (2): +10")
 
-        # Factor F: Trend Filter (Falling-Knife Penalty)
         if price_30d < -30.0:
             score -= 25
             breakdown.append(f"Deep drop value trap filter ({price_30d:.1f}%): -25")
@@ -259,14 +247,13 @@ def process_advanced_conviction_metrics(df):
         scores.append(final_score)
         explanations.append(" | ".join(breakdown))
 
-        # Signal Flags
         trade_emojis = []
         if distinct_csuite_insiders >= 2 or distinct_all_insiders >= 3:
-            trade_emojis.append("🔥")  # Cluster Consensus
+            trade_emojis.append("\U0001f525")
         if is_tier1 and est_val >= 100000:
-            trade_emojis.append("⚡")  # Operational Leadership Buy
+            trade_emojis.append("\u26a1")
         if position_increase_pct >= 25.0 and est_val >= 50000:
-            trade_emojis.append("🚀")  # Major Skin-in-the-Game
+            trade_emojis.append("\U0001f680")
 
         flags.append(" ".join(trade_emojis) if trade_emojis else "—")
 
@@ -278,73 +265,42 @@ def process_advanced_conviction_metrics(df):
     )
 
 
-st.title("📊 Insider Transactions Dashboard")
-st.write(
-    "Market-wide tracking of high-conviction open-market executive purchases ($50,000+)."
-)
-
-conn = None
-try:
+@st.cache_data(ttl=600)
+def load_and_process_data(selected_year, selected_month, max_rows, hide_institutions):
     conn = get_db_connection()
+    try:
+        where_clauses = []
+        if selected_year == "Older":
+            where_clauses.append("LEFT(transaction_date, 4) < '2024'")
+        elif selected_year != "All Years":
+            where_clauses.append(f"LEFT(transaction_date, 4) = '{selected_year}'")
 
-    st.sidebar.header("Filter Dashboard")
-    selected_year = st.sidebar.selectbox(
-        "Filter by Year", ["All Years", "2026", "2025", "2024", "Older"]
-    )
+        months_list = [
+            "All Months", "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December"
+        ]
+        if selected_month != "All Months":
+            month_idx = months_list.index(selected_month)
+            month_str = f"{month_idx:02d}"
+            where_clauses.append(f"SUBSTRING(transaction_date, 6, 2) = '{month_str}'")
 
-    months = [
-        "All Months",
-        "January",
-        "February",
-        "March",
-        "April",
-        "May",
-        "June",
-        "July",
-        "August",
-        "September",
-        "October",
-        "November",
-        "December",
-    ]
-    selected_month = st.sidebar.selectbox("Filter by Month", months, index=0)
+        where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
-    max_rows = st.sidebar.slider(
-        "Max Rows to Load & Analyze", 50, 1000, 200, step=50
-    )
-
-    hide_institutions = st.sidebar.checkbox(
-        "Hide Institutional / Fund Entities", value=False
-    )
-
-    where_clauses = []
-    if selected_year == "Older":
-        where_clauses.append("LEFT(transaction_date, 4) < '2024'")
-    elif selected_year != "All Years":
-        where_clauses.append(f"LEFT(transaction_date, 4) = '{selected_year}'")
-
-    if selected_month != "All Months":
-        month_idx = months.index(selected_month)
-        month_str = f"{month_idx:02d}"
-        where_clauses.append(f"SUBSTRING(transaction_date, 6, 2) = '{month_str}'")
-
-    where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
-
-    query = f"""
-        SELECT transaction_date, ticker, sector, insider_name, insider_title, 
-               shares_bought, shares_owned_following, est_value, activity_type,
-               market_cap, market_cap_category, benchmark_ticker,
-               price_at_tx, price_60d_after, price_180d_after
-        FROM insider_trades 
-        {where_sql}
-        ORDER BY transaction_date DESC
-        LIMIT {max_rows};
-    """
-
-    df = pd.read_sql(query, conn)
+        query = f"""
+            SELECT transaction_date, ticker, sector, insider_name, insider_title, 
+                   shares_bought, shares_owned_following, est_value, activity_type,
+                   market_cap, market_cap_category, benchmark_ticker,
+                   price_at_tx, price_60d_after, price_180d_after
+            FROM insider_trades 
+            {where_sql}
+            ORDER BY transaction_date DESC
+            LIMIT {max_rows};
+        """
+        df = pd.read_sql(query, conn)
+    finally:
+        conn.close()
 
     if not df.empty:
-        # Group same-day multi-lot buys by same insider
         group_cols = ["transaction_date", "ticker", "insider_name"]
         agg_rules = {
             "sector": "first",
@@ -371,13 +327,7 @@ try:
 
         if hide_institutions:
             fund_keywords = [
-                "LLC",
-                "L.P.",
-                "PARTNERS",
-                "FUNDS",
-                "CAPITAL",
-                "INVESTMENT",
-                "MANAGEMENT",
+                "LLC", "L.P.", "PARTNERS", "FUNDS", "CAPITAL", "INVESTMENT", "MANAGEMENT"
             ]
             pattern = "|".join(fund_keywords)
             df = df[
@@ -421,7 +371,6 @@ try:
             lambda x: f"${x:,.0f}" if pd.notnull(x) else "$0"
         )
 
-        # Tier Labeling for Visual Badges
         def assign_tier_label(score):
             if score >= 70:
                 return "⭐ Executive Consensus"
@@ -440,9 +389,7 @@ try:
             tx_date = pd.to_datetime(str(row["transaction_date"])[:10])
             if (current_date - tx_date).days <= 2 and profit == 0:
                 return "N/A (New)"
-            return (
-                f"+${profit:,.0f}" if profit >= 0 else f"-${abs(profit):,.0f}"
-            )
+            return f"+${profit:,.0f}" if profit >= 0 else f"-${abs(profit):,.0f}"
 
         def format_return(row):
             ret = row["Return (%)"]
@@ -454,7 +401,6 @@ try:
         df["Unrealized Gain"] = df.apply(format_gain, axis=1)
         df["Total Return"] = df.apply(format_return, axis=1)
 
-        # Helper function for 60D & 180D forward return calculations
         def format_forward_return(row, target_col, days_required):
             p_tx = row.get("price_at_tx")
             p_target = row.get(target_col)
@@ -483,243 +429,227 @@ try:
             lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
         )
 
-        show_flags_only = st.sidebar.checkbox(
-            "Show High Conviction Signals Only", value=False
-        )
-        min_score = st.sidebar.slider(
-            "Minimum Conviction Score",
-            min_value=10,
-            max_value=90,
-            value=10,
-            step=5,
-        )
+    return df
 
-        st.sidebar.markdown("---")
-        st.sidebar.markdown("### 📖 Signal & Tier Legend")
-        st.sidebar.markdown("""
+
+st.title("📊 Insider Transactions Dashboard")
+st.write(
+    "Market-wide tracking of high-conviction open-market executive purchases ($50,000+)."
+)
+
+st.sidebar.header("Filter Dashboard")
+selected_year = st.sidebar.selectbox(
+    "Filter by Year", ["All Years", "2026", "2025", "2024", "Older"]
+)
+
+months = [
+    "All Months", "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+selected_month = st.sidebar.selectbox("Filter by Month", months, index=0)
+
+max_rows = st.sidebar.slider(
+    "Max Rows to Load & Analyze", 50, 1000, 200, step=50
+)
+
+hide_institutions = st.sidebar.checkbox(
+    "Hide Institutional / Fund Entities", value=False
+)
+
+df = load_and_process_data(selected_year, selected_month, max_rows, hide_institutions)
+
+if not df.empty:
+    show_flags_only = st.sidebar.checkbox(
+        "Show High Conviction Signals Only", value=False
+    )
+    min_score = st.sidebar.slider(
+        "Minimum Conviction Score",
+        min_value=10,
+        max_value=90,
+        value=10,
+        step=5,
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 📖 Signal & Tier Legend")
+    st.sidebar.markdown("""
 - **⭐ Executive Consensus (70+)**: Top-tier cluster buying & skin-in-the-game.
 - **🟢 High Conviction (50-69)**: Strong standalone executive purchase.
 - **🔥** **Cluster Consensus** (2+ distinct C-Suite/execs buying within 30 days)
-- **⚡** **Operational Leadership** (CEO, CFO, or COO purchase $\ge \$100k$)
-- **🚀** **Skin-in-the-Game** ($\ge 25\%$ personal position expansion, $\ge \$50k$)
-        """)
+- **⚡** **Operational Leadership** (CEO, CFO, or COO purchase >= $100k)
+- **🚀** **Skin-in-the-Game** (>= 25% personal position expansion, >= $50k)
+    """)
 
-        st.sidebar.markdown("---")
-        st.sidebar.markdown("### 💾 Export Data")
-        csv_export = df.to_csv(index=False).encode("utf-8")
-        st.sidebar.download_button(
-            label="📥 Download Current Data (CSV)",
-            data=csv_export,
-            file_name="insider_trades_filtered.csv",
-            mime="text/csv",
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 💾 Export Data")
+    csv_export = df.to_csv(index=False).encode("utf-8")
+    st.sidebar.download_button(
+        label="📥 Download Current Data (CSV)",
+        data=csv_export,
+        file_name="insider_trades_filtered.csv",
+        mime="text/csv",
+    )
+
+    tab1, tab2 = st.tabs([
+        "📊 Live Transactions Feed",
+        "🏆 Insider Leaderboard",
+    ])
+
+    with tab1:
+        high_alert_count = len(df[df["High Conviction Flag"] != "—"])
+
+        col1, col2, col3, col4, col5 = st.columns(5)
+        col1.metric("Total Trades Tracked", len(df))
+        col2.metric("🔥 High Conviction Signals", high_alert_count)
+        col3.metric(
+            "Avg Conviction Score",
+            f"{int(df['Conviction Score'].mean())}/100",
+        )
+        col4.metric("Unique Insiders", df["insider_name"].nunique())
+        col5.metric(
+            "Total Dollar Volume",
+            f"${df['est_value'].astype(float).sum():,.0f}",
         )
 
-        tab1, tab2 = st.tabs([
-            "📊 Live Transactions Feed",
-            "🏆 Insider Leaderboard",
-        ])
+        st.markdown("---")
 
-        with tab1:
-            high_alert_count = len(df[df["High Conviction Flag"] != "—"])
-
-            col1, col2, col3, col4, col5 = st.columns(5)
-            col1.metric("Total Trades Tracked", len(df))
-            col2.metric("🔥 High Conviction Signals", high_alert_count)
-            col3.metric(
-                "Avg Conviction Score",
-                f"{int(df['Conviction Score'].mean())}/100",
-            )
-            col4.metric("Unique Insiders", df["insider_name"].nunique())
-            col5.metric(
-                "Total Dollar Volume",
-                f"${df['est_value'].astype(float).sum():,.0f}",
-            )
-
-            st.markdown("---")
-
-            display_source = df[df["Conviction Score"] >= min_score]
-            if show_flags_only:
-                display_source = display_source[
-                    display_source["High Conviction Flag"] != "—"
-                ]
-
-            st.subheader("📋 Insider Transactions Database")
-
-            display_df = display_source[[
-                "transaction_date",
-                "Conviction Score",
-                "Conviction Tier",
-                "High Conviction Flag",
-                "ticker",
-                "sector",
-                "insider_name",
-                "insider_title",
-                "Shares Bought",
-                "Est. Value ($)",
-                "Unrealized Gain",
-                "Total Return",
-                "60D Return",
-                "180D Return",
-                "Market Cap at Tx",
-                "market_cap_category",
-                "benchmark_ticker",
-                "Benchmark Return",
-                "Alpha Return",
-            ]]
-
-            display_df.columns = [
-                "Transaction Date",
-                "Score",
-                "Tier",
-                "Signals",
-                "Ticker",
-                "Sector",
-                "Insider Name",
-                "Title",
-                "Shares Bought",
-                "Est. Value ($)",
-                "Unrealized Gain (Inc. Divs)",
-                "Total Return",
-                "60D Return",
-                "180D Return",
-                "Market Cap at Tx",
-                "Market Cap Tier",
-                "Benchmark",
-                "Benchmark Return",
-                "Alpha vs Benchmark",
+        display_source = df[df["Conviction Score"] >= min_score]
+        if show_flags_only:
+            display_source = display_source[
+                display_source["High Conviction Flag"] != "—"
             ]
 
-            st.dataframe(display_df, use_container_width=True)
+        st.subheader("📋 Insider Transactions Database")
 
-            # --- INTERACTIVE INSPECT CARD BELOW THE TABLE ---
-            st.markdown("### 🔍 Inspect Score Breakdown")
-            st.write("Select any transaction below to audit its exact scoring components:")
+        display_df = display_source[[
+            "transaction_date",
+            "Conviction Score",
+            "Conviction Tier",
+            "High Conviction Flag",
+            "ticker",
+            "sector",
+            "insider_name",
+            "insider_title",
+            "Shares Bought",
+            "Est. Value ($)",
+            "Unrealized Gain",
+            "Total Return",
+            "60D Return",
+            "180D Return",
+            "Market Cap at Tx",
+            "market_cap_category",
+            "benchmark_ticker",
+            "Benchmark Return",
+            "Alpha Return",
+        ]]
 
-            if not display_source.empty:
-                display_source["Select Label"] = (
-                    display_source["ticker"] + " — " + 
-                    display_source["insider_name"] + " (" + 
-                    display_source["transaction_date"].astype(str).str[:10] + 
-                    " | Score: " + display_source["Conviction Score"].astype(str) + ")"
-                )
-                
-                selected_trade_label = st.selectbox(
-                    "Choose a transaction to inspect:",
-                    display_source["Select Label"].tolist()
-                )
+        display_df.columns = [
+            "Transaction Date",
+            "Score",
+            "Tier",
+            "Signals",
+            "Ticker",
+            "Sector",
+            "Insider Name",
+            "Title",
+            "Shares Bought",
+            "Est. Value ($)",
+            "Unrealized Gain (Inc. Divs)",
+            "Total Return",
+            "60D Return",
+            "180D Return",
+            "Market Cap at Tx",
+            "Market Cap Tier",
+            "Benchmark",
+            "Benchmark Return",
+            "Alpha vs Benchmark",
+        ]
 
-                selected_row = display_source[
-                    display_source["Select Label"] == selected_trade_label
-                ].iloc[0]
+        event = st.dataframe(
+            display_df,
+            use_container_width=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="insider_table_selection"
+        )
 
-                col_a, col_b = st.columns([1, 2])
-                with col_a:
-                    st.metric("Conviction Score", f"{selected_row['Conviction Score']} / 100")
-                    st.write(f"**Tier:** {selected_row['Conviction Tier']}")
-                    st.write(f"**Signals:** {selected_row['High Conviction Flag']}")
-                    st.write(f"**60D Return:** {selected_row['60D Return']} | **180D Return:** {selected_row['180D Return']}")
-                with col_b:
-                    st.markdown("**Scoring Audit Trail:**")
-                    components = selected_row["Score Breakdown"].split(" | ")
-                    for comp in components:
-                        st.markdown(f"- {comp}")
+        selected_indices = event.get("selection", {}).get("rows", [])
 
-        with tab2:
-            st.subheader("🏆 Aggregate Insider Performance Leaderboard")
-            leaderboard_source = df.copy()
+        st.markdown("### 🔍 Inspect Score Breakdown")
+        if len(selected_indices) > 0:
+            row_idx = selected_indices[0]
+            selected_row = display_source.iloc[row_idx]
 
-            if not leaderboard_source.empty:
-                leaderboard = (
-                    leaderboard_source.groupby(["insider_name", "ticker"])
-                    .agg({
-                        "shares_bought": "sum",
-                        "est_value": "sum",
-                        "Unrealized Profit ($)": "sum",
-                    })
-                    .reset_index()
-                )
+            st.write(f"**Selected:** {selected_row['ticker']} — {selected_row['insider_name']} ({str(selected_row['transaction_date'])[:10]} | Score: {selected_row['Conviction Score']})")
 
-                leaderboard["roi_pct"] = (
-                    leaderboard["Unrealized Profit ($)"]
-                    / leaderboard["est_value"]
-                ) * 100.0
+            col_a, col_b = st.columns([1, 2])
+            with col_a:
+                st.metric("Conviction Score", f"{selected_row['Conviction Score']} / 100")
+                st.write(f"**Tier:** {selected_row['Conviction Tier']}")
+                st.write(f"**Signals:** {selected_row['High Conviction Flag']}")
+                st.write(f"**60D Return:** {selected_row['60D Return']} | **180D Return:** {selected_row['180D Return']}")
+            with col_b:
+                st.markdown("**Scoring Audit Trail:**")
+                components = selected_row["Score Breakdown"].split(" | ")
+                for comp in components:
+                    st.markdown(f"- {comp}")
+        else:
+            st.info("👆 Click any row in the table above to inspect its exact scoring breakdown and audit trail.")
 
-                leaderboard["Total Invested"] = leaderboard["est_value"].apply(
-                    lambda x: f"${x:,.0f}"
-                )
-                leaderboard["Net Profit/Loss ($)"] = leaderboard[
-                    "Unrealized Profit ($)"
-                ].apply(
-                    lambda x: f"+${x:,.0f}" if x >= 0 else f"-${abs(x):,.0f}"
-                )
-                leaderboard["Cumulative ROI (%)"] = leaderboard["roi_pct"].apply(
-                    lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
-                )
+    with tab2:
+        st.subheader("🏆 Aggregate Insider Directory & Track Record")
+        leaderboard_source = df.copy()
 
-                col_left, col_right = st.columns(2)
+        if not leaderboard_source.empty:
+            search_query = st.text_input("🔍 Search by Purchaser Name or Ticker:", "")
 
-                with col_left:
-                    st.markdown("### 🟢 Top Dollar Winners ($)")
-                    top_dollar_winners = leaderboard.sort_values(
-                        by="Unrealized Profit ($)", ascending=False
-                    ).head(10)
-                    st.dataframe(
-                        top_dollar_winners[[
-                            "insider_name",
-                            "ticker",
-                            "Total Invested",
-                            "Net Profit/Loss ($)",
-                            "Cumulative ROI (%)",
-                        ]],
-                        use_container_width=True,
-                    )
+            agg_df = (
+                leaderboard_source.groupby("insider_name")
+                .agg({
+                    "ticker": lambda x: ", ".join(x.unique()),
+                    "shares_bought": "sum",
+                    "est_value": "sum",
+                    "Unrealized Profit ($)": "sum",
+                    "Alpha Return (%)": "mean",
+                    "transaction_date": "count"
+                })
+                .reset_index()
+            )
+            agg_df.columns = ["Insider Name", "Tickers Traded", "Total Shares", "Total Invested ($)", "Net Profit/Loss ($)", "Avg Alpha vs Benchmark (%)", "Total Trades"]
 
-                    st.markdown("### 🔴 Top Dollar Losers ($)")
-                    top_dollar_losers = leaderboard.sort_values(
-                        by="Unrealized Profit ($)", ascending=True
-                    ).head(10)
-                    st.dataframe(
-                        top_dollar_losers[[
-                            "insider_name",
-                            "ticker",
-                            "Total Invested",
-                            "Net Profit/Loss ($)",
-                            "Cumulative ROI (%)",
-                        ]],
-                        use_container_width=True,
-                    )
+            agg_df["Cumulative ROI (%)"] = (agg_df["Net Profit/Loss ($)"] / agg_df["Total Invested ($)"]) * 100.0
 
-                with col_right:
-                    st.markdown("### 🚀 Top ROI Winners (%)")
-                    top_pct_winners = leaderboard.sort_values(
-                        by="roi_pct", ascending=False
-                    ).head(10)
-                    st.dataframe(
-                        top_pct_winners[[
-                            "insider_name",
-                            "ticker",
-                            "Total Invested",
-                            "Net Profit/Loss ($)",
-                            "Cumulative ROI (%)",
-                        ]],
-                        use_container_width=True,
-                    )
+            if search_query:
+                q = search_query.upper()
+                agg_df = agg_df[
+                    agg_df["Insider Name"].str.upper().str.contains(q, na=False) |
+                    agg_df["Tickers Traded"].str.upper().str.contains(q, na=False)
+                ]
 
-                    st.markdown("### 📉 Top ROI Losers (%)")
-                    top_pct_losers = leaderboard.sort_values(
-                        by="roi_pct", ascending=True
-                    ).head(10)
-                    st.dataframe(
-                        top_pct_losers[[
-                            "insider_name",
-                            "ticker",
-                            "Total Invested",
-                            "Net Profit/Loss ($)",
-                            "Cumulative ROI (%)",
-                        ]],
-                        use_container_width=True,
-                    )
+            agg_df["Total Invested ($)"] = agg_df["Total Invested ($)"].apply(lambda x: f"${x:,.0f}")
+            agg_df["Net Profit/Loss ($)"] = agg_df["Net Profit/Loss ($)"].apply(lambda x: f"+${x:,.0f}" if x >= 0 else f"-${abs(x):,.0f}")
+            agg_df["Avg Alpha vs Benchmark (%)"] = agg_df["Avg Alpha vs Benchmark (%)"].apply(lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%")
 
-finally:
-    if conn:
-        conn.close()
+            p_event = st.dataframe(
+                agg_df.sort_values(by="Total Trades", ascending=False),
+                use_container_width=True,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="purchaser_table_selection"
+            )
+
+            p_selected_indices = p_event.get("selection", {}).get("rows", [])
+            if len(p_selected_indices) > 0:
+                sorted_agg = agg_df.sort_values(by="Total Trades", ascending=False).reset_index(drop=True)
+                chosen_purchaser = sorted_agg.iloc[p_selected_indices[0]]["Insider Name"]
+
+                st.markdown(f"### 📄 Trade History for: {chosen_purchaser}")
+                purchaser_trades = leaderboard_source[leaderboard_source["insider_name"] == chosen_purchaser][[
+                    "transaction_date", "ticker", "Conviction Score", "Conviction Tier", 
+                    "Shares Bought", "Est. Value ($)", "Total Return", "Alpha Return"
+                ]]
+                st.dataframe(purchaser_trades, use_container_width=True)
+            else:
+                st.info("👆 Click any purchaser row above to view their full chronological trade history and performance.")
+else:
+    st.warning("No transactions found for the selected filters.")
