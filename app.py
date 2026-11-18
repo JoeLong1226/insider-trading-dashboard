@@ -249,11 +249,11 @@ def process_advanced_conviction_metrics(df):
 
         trade_emojis = []
         if distinct_csuite_insiders >= 2 or distinct_all_insiders >= 3:
-            trade_emojis.append("\U0001f525")
+            trade_emojis.append("🔥")
         if is_tier1 and est_val >= 100000:
-            trade_emojis.append("\u26a1")
+            trade_emojis.append("⚡")
         if position_increase_pct >= 25.0 and est_val >= 50000:
-            trade_emojis.append("\U0001f680")
+            trade_emojis.append("🚀")
 
         flags.append(" ".join(trade_emojis) if trade_emojis else "—")
 
@@ -265,8 +265,144 @@ def process_advanced_conviction_metrics(df):
     )
 
 
+def enrich_dataframe(df):
+    """Applies grouping, performance calculations, and formatting to a raw trades DataFrame."""
+    if df.empty:
+        return df
+
+    group_cols = ["transaction_date", "ticker", "insider_name"]
+    agg_rules = {
+        "sector": "first",
+        "insider_title": "first",
+        "shares_bought": "sum",
+        "shares_owned_following": "last",
+        "est_value": "sum",
+        "activity_type": "first",
+        "market_cap": "first",
+        "market_cap_category": "first",
+        "benchmark_ticker": "first",
+        "price_at_tx": "first",
+        "price_60d_after": "first",
+        "price_180d_after": "first",
+        "return_60d_pct": "first",
+        "return_180d_pct": "first",
+        "bench_return_60d_pct": "first",
+        "bench_return_180d_pct": "first",
+    }
+    df = df.groupby(group_cols, as_index=False).agg(agg_rules)
+
+    df["sector"] = df.apply(
+        lambda row: get_stock_sector(row["ticker"])
+        if row["sector"] in ["Unclassified", None, ""]
+        else row["sector"],
+        axis=1,
+    )
+
+    perf = [
+        calculate_trade_performance(
+            row["ticker"],
+            row.get("benchmark_ticker"),
+            row["transaction_date"],
+            float(row["shares_bought"] or 0),
+            float(row["est_value"] or 0),
+        )
+        for _, row in df.iterrows()
+    ]
+    df["Unrealized Profit ($)"] = [p[0] for p in perf]
+    df["Return (%)"] = [p[1] for p in perf]
+    df["price_30d_change_pct"] = [p[2] for p in perf]
+    df["est_value"] = [p[3] for p in perf]
+    df["Benchmark Return (%)"] = [p[4] for p in perf]
+    df["Alpha Return (%)"] = [p[5] for p in perf]
+
+    df = process_advanced_conviction_metrics(df)
+
+    def format_market_cap(x):
+        if pd.notnull(x) and x > 0:
+            if x >= 1e9:
+                return f"${x / 1e9:.1f}B"
+            elif x >= 1e6:
+                return f"${x / 1e6:.1f}M"
+            return f"${x:,.0f}"
+        return "N/A"
+
+    df["Market Cap at Tx"] = df["market_cap"].apply(format_market_cap)
+    df["Shares Bought"] = df["shares_bought"].apply(
+        lambda x: f"+{x:,.0f}" if pd.notnull(x) else "+0"
+    )
+    df["Est. Value ($)"] = df["est_value"].apply(
+        lambda x: f"${x:,.0f}" if pd.notnull(x) else "$0"
+    )
+
+    def assign_tier_label(score):
+        if score >= 70:
+            return "⭐ Executive Consensus"
+        elif score >= 50:
+            return "🟢 High Conviction"
+        elif score >= 30:
+            return "🟡 Moderate"
+        return "⚪ Low"
+
+    df["Conviction Tier"] = df["Conviction Score"].apply(assign_tier_label)
+
+    current_date = pd.Timestamp.now().normalize()
+
+    def format_gain(row):
+        profit = row["Unrealized Profit ($)"]
+        tx_date = pd.to_datetime(str(row["transaction_date"])[:10])
+        if (current_date - tx_date).days <= 2 and profit == 0:
+            return "N/A (New)"
+        return f"+${profit:,.0f}" if profit >= 0 else f"-${abs(profit):,.0f}"
+
+    def format_return(row):
+        ret = row["Return (%)"]
+        tx_date = pd.to_datetime(str(row["transaction_date"])[:10])
+        if (current_date - tx_date).days <= 2 and ret == 0:
+            return "N/A (New)"
+        return f"+{ret:.1f}%" if ret >= 0 else f"{ret:.1f}%"
+
+    df["Unrealized Gain"] = df.apply(format_gain, axis=1)
+    df["Total Return"] = df.apply(format_return, axis=1)
+
+    # --- COMPUTE 60D & 180D ALPHA DIRECTLY FROM SUPABASE PRE-COMPUTED COLUMNS ---
+    def compute_horizon_alpha(row, stock_ret_col, bench_ret_col, days_required):
+        s_ret = row.get(stock_ret_col)
+        b_ret = row.get(bench_ret_col)
+        tx_date = pd.to_datetime(str(row["transaction_date"])[:10])
+
+        if pd.notnull(s_ret) and pd.notnull(b_ret):
+            alpha_val = float(s_ret) - float(b_ret)
+            return alpha_val, (f"+{alpha_val:.1f}%" if alpha_val >= 0 else f"{alpha_val:.1f}%")
+
+        days_elapsed = (current_date - tx_date).days
+        if days_elapsed < days_required:
+            return None, "Pending"
+        return None, "N/A"
+
+    alpha_60_results = df.apply(
+        lambda r: compute_horizon_alpha(r, "return_60d_pct", "bench_return_60d_pct", 60), axis=1
+    )
+    df["alpha_60d_num"] = [res[0] for res in alpha_60_results]
+    df["60D Alpha"] = [res[1] for res in alpha_60_results]
+
+    alpha_180_results = df.apply(
+        lambda r: compute_horizon_alpha(r, "return_180d_pct", "bench_return_180d_pct", 180), axis=1
+    )
+    df["alpha_180d_num"] = [res[0] for res in alpha_180_results]
+    df["180D Alpha"] = [res[1] for res in alpha_180_results]
+
+    df["Benchmark Return"] = df["Benchmark Return (%)"].apply(
+        lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
+    )
+    df["Alpha Return"] = df["Alpha Return (%)"].apply(
+        lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
+    )
+
+    return df
+
+
 @st.cache_data(ttl=600)
-def load_and_process_data(selected_year, selected_month, max_rows, hide_institutions):
+def load_filtered_feed(selected_year, selected_month, max_rows):
     conn = get_db_connection()
     try:
         where_clauses = []
@@ -290,7 +426,8 @@ def load_and_process_data(selected_year, selected_month, max_rows, hide_institut
             SELECT transaction_date, ticker, sector, insider_name, insider_title, 
                    shares_bought, shares_owned_following, est_value, activity_type,
                    market_cap, market_cap_category, benchmark_ticker,
-                   price_at_tx, price_60d_after, price_180d_after
+                   price_at_tx, price_60d_after, price_180d_after,
+                   return_60d_pct, return_180d_pct, bench_return_60d_pct, bench_return_180d_pct
             FROM insider_trades 
             {where_sql}
             ORDER BY transaction_date DESC
@@ -300,136 +437,41 @@ def load_and_process_data(selected_year, selected_month, max_rows, hide_institut
     finally:
         conn.close()
 
-    if not df.empty:
-        group_cols = ["transaction_date", "ticker", "insider_name"]
-        agg_rules = {
-            "sector": "first",
-            "insider_title": "first",
-            "shares_bought": "sum",
-            "shares_owned_following": "last",
-            "est_value": "sum",
-            "activity_type": "first",
-            "market_cap": "first",
-            "market_cap_category": "first",
-            "benchmark_ticker": "first",
-            "price_at_tx": "first",
-            "price_60d_after": "first",
-            "price_180d_after": "first",
-        }
-        df = df.groupby(group_cols, as_index=False).agg(agg_rules)
+    return enrich_dataframe(df)
 
-        df["sector"] = df.apply(
-            lambda row: get_stock_sector(row["ticker"])
-            if row["sector"] in ["Unclassified", None, ""]
-            else row["sector"],
-            axis=1,
-        )
 
-        if hide_institutions:
-            fund_keywords = [
-                "LLC", "L.P.", "PARTNERS", "FUNDS", "CAPITAL", "INVESTMENT", "MANAGEMENT"
-            ]
-            pattern = "|".join(fund_keywords)
-            df = df[
-                ~df["insider_name"].str.upper().str.contains(pattern, na=False)
-            ].reset_index(drop=True)
+@st.cache_data(ttl=600)
+def load_full_history_for_directory(limit_rows=2500):
+    """Loads broader historical window so Tab 2 shows full track records regardless of Tab 1 month/year filters."""
+    conn = get_db_connection()
+    try:
+        query = f"""
+            SELECT transaction_date, ticker, sector, insider_name, insider_title, 
+                   shares_bought, shares_owned_following, est_value, activity_type,
+                   market_cap, market_cap_category, benchmark_ticker,
+                   price_at_tx, price_60d_after, price_180d_after,
+                   return_60d_pct, return_180d_pct, bench_return_60d_pct, bench_return_180d_pct
+            FROM insider_trades 
+            ORDER BY transaction_date DESC
+            LIMIT {limit_rows};
+        """
+        df = pd.read_sql(query, conn)
+    finally:
+        conn.close()
 
-    if not df.empty:
-        perf = [
-            calculate_trade_performance(
-                row["ticker"],
-                row.get("benchmark_ticker"),
-                row["transaction_date"],
-                float(row["shares_bought"] or 0),
-                float(row["est_value"] or 0),
-            )
-            for _, row in df.iterrows()
-        ]
-        df["Unrealized Profit ($)"] = [p[0] for p in perf]
-        df["Return (%)"] = [p[1] for p in perf]
-        df["price_30d_change_pct"] = [p[2] for p in perf]
-        df["est_value"] = [p[3] for p in perf]
-        df["Benchmark Return (%)"] = [p[4] for p in perf]
-        df["Alpha Return (%)"] = [p[5] for p in perf]
+    return enrich_dataframe(df)
 
-        df = process_advanced_conviction_metrics(df)
 
-        def format_market_cap(x):
-            if pd.notnull(x) and x > 0:
-                if x >= 1e9:
-                    return f"${x / 1e9:.1f}B"
-                elif x >= 1e6:
-                    return f"${x / 1e6:.1f}M"
-                return f"${x:,.0f}"
-            return "N/A"
-
-        df["Market Cap at Tx"] = df["market_cap"].apply(format_market_cap)
-        df["Shares Bought"] = df["shares_bought"].apply(
-            lambda x: f"+{x:,.0f}" if pd.notnull(x) else "+0"
-        )
-        df["Est. Value ($)"] = df["est_value"].apply(
-            lambda x: f"${x:,.0f}" if pd.notnull(x) else "$0"
-        )
-
-        def assign_tier_label(score):
-            if score >= 70:
-                return "⭐ Executive Consensus"
-            elif score >= 50:
-                return "🟢 High Conviction"
-            elif score >= 30:
-                return "🟡 Moderate"
-            return "⚪ Low"
-
-        df["Conviction Tier"] = df["Conviction Score"].apply(assign_tier_label)
-
-        current_date = pd.Timestamp.now().normalize()
-
-        def format_gain(row):
-            profit = row["Unrealized Profit ($)"]
-            tx_date = pd.to_datetime(str(row["transaction_date"])[:10])
-            if (current_date - tx_date).days <= 2 and profit == 0:
-                return "N/A (New)"
-            return f"+${profit:,.0f}" if profit >= 0 else f"-${abs(profit):,.0f}"
-
-        def format_return(row):
-            ret = row["Return (%)"]
-            tx_date = pd.to_datetime(str(row["transaction_date"])[:10])
-            if (current_date - tx_date).days <= 2 and ret == 0:
-                return "N/A (New)"
-            return f"+{ret:.1f}%" if ret >= 0 else f"{ret:.1f}%"
-
-        df["Unrealized Gain"] = df.apply(format_gain, axis=1)
-        df["Total Return"] = df.apply(format_return, axis=1)
-
-        def format_forward_return(row, target_col, days_required):
-            p_tx = row.get("price_at_tx")
-            p_target = row.get(target_col)
-            tx_date = pd.to_datetime(str(row["transaction_date"])[:10])
-
-            if pd.isnull(p_tx) or pd.isnull(p_target) or p_tx <= 0:
-                days_elapsed = (current_date - tx_date).days
-                if days_elapsed < days_required:
-                    return "Pending"
-                return "N/A"
-
-            ret = ((p_target - p_tx) / p_tx) * 100.0
-            return f"+{ret:.1f}%" if ret >= 0 else f"{ret:.1f}%"
-
-        df["60D Return"] = df.apply(
-            lambda r: format_forward_return(r, "price_60d_after", 60), axis=1
-        )
-        df["180D Return"] = df.apply(
-            lambda r: format_forward_return(r, "price_180d_after", 180), axis=1
-        )
-
-        df["Benchmark Return"] = df["Benchmark Return (%)"].apply(
-            lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
-        )
-        df["Alpha Return"] = df["Alpha Return (%)"].apply(
-            lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
-        )
-
-    return df
+def filter_out_institutions(df, hide_flag):
+    if not hide_flag or df.empty:
+        return df
+    fund_keywords = [
+        "LLC", "L.P.", "PARTNERS", "FUNDS", "CAPITAL", "INVESTMENT", "MANAGEMENT"
+    ]
+    pattern = "|".join(fund_keywords)
+    return df[
+        ~df["insider_name"].str.upper().str.contains(pattern, na=False)
+    ].reset_index(drop=True)
 
 
 st.title("📊 Insider Transactions Dashboard")
@@ -439,63 +481,65 @@ st.write(
 
 st.sidebar.header("Filter Dashboard")
 selected_year = st.sidebar.selectbox(
-    "Filter by Year", ["All Years", "2026", "2025", "2024", "Older"]
+    "Filter by Year (Live Feed)", ["All Years", "2026", "2025", "2024", "Older"]
 )
 
 months = [
     "All Months", "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
 ]
-selected_month = st.sidebar.selectbox("Filter by Month", months, index=0)
+selected_month = st.sidebar.selectbox("Filter by Month (Live Feed)", months, index=0)
 
 max_rows = st.sidebar.slider(
-    "Max Rows to Load & Analyze", 50, 1000, 200, step=50
+    "Max Rows to Load (Live Feed)", 50, 1000, 200, step=50
 )
 
 hide_institutions = st.sidebar.checkbox(
     "Hide Institutional / Fund Entities", value=False
 )
 
-df = load_and_process_data(selected_year, selected_month, max_rows, hide_institutions)
+df_feed_raw = load_filtered_feed(selected_year, selected_month, max_rows)
+df = filter_out_institutions(df_feed_raw, hide_institutions)
 
-if not df.empty:
-    show_flags_only = st.sidebar.checkbox(
-        "Show High Conviction Signals Only", value=False
-    )
-    min_score = st.sidebar.slider(
-        "Minimum Conviction Score",
-        min_value=10,
-        max_value=90,
-        value=10,
-        step=5,
-    )
+show_flags_only = st.sidebar.checkbox(
+    "Show High Conviction Signals Only", value=False
+)
+min_score = st.sidebar.slider(
+    "Minimum Conviction Score",
+    min_value=10,
+    max_value=90,
+    value=10,
+    step=5,
+)
 
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### 📖 Signal & Tier Legend")
-    st.sidebar.markdown("""
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 📖 Signal & Tier Legend")
+st.sidebar.markdown("""
 - **⭐ Executive Consensus (70+)**: Top-tier cluster buying & skin-in-the-game.
 - **🟢 High Conviction (50-69)**: Strong standalone executive purchase.
 - **🔥** **Cluster Consensus** (2+ distinct C-Suite/execs buying within 30 days)
 - **⚡** **Operational Leadership** (CEO, CFO, or COO purchase >= $100k)
 - **🚀** **Skin-in-the-Game** (>= 25% personal position expansion, >= $50k)
-    """)
+""")
 
+if not df.empty:
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 💾 Export Data")
     csv_export = df.to_csv(index=False).encode("utf-8")
     st.sidebar.download_button(
-        label="📥 Download Current Data (CSV)",
+        label="📥 Download Current Feed (CSV)",
         data=csv_export,
         file_name="insider_trades_filtered.csv",
         mime="text/csv",
     )
 
-    tab1, tab2 = st.tabs([
-        "📊 Live Transactions Feed",
-        "🏆 Insider Leaderboard",
-    ])
+tab1, tab2 = st.tabs([
+    "📊 Live Transactions Feed",
+    "🕵️ Recent Buyers & Track Record",
+])
 
-    with tab1:
+with tab1:
+    if not df.empty:
         high_alert_count = len(df[df["High Conviction Flag"] != "—"])
 
         col1, col2, col3, col4, col5 = st.columns(5)
@@ -534,8 +578,8 @@ if not df.empty:
             "Est. Value ($)",
             "Unrealized Gain",
             "Total Return",
-            "60D Return",
-            "180D Return",
+            "60D Alpha",
+            "180D Alpha",
             "Market Cap at Tx",
             "market_cap_category",
             "benchmark_ticker",
@@ -556,8 +600,8 @@ if not df.empty:
             "Est. Value ($)",
             "Unrealized Gain (Inc. Divs)",
             "Total Return",
-            "60D Return",
-            "180D Return",
+            "60D Alpha",
+            "180D Alpha",
             "Market Cap at Tx",
             "Market Cap Tier",
             "Benchmark",
@@ -587,7 +631,7 @@ if not df.empty:
                 st.metric("Conviction Score", f"{selected_row['Conviction Score']} / 100")
                 st.write(f"**Tier:** {selected_row['Conviction Tier']}")
                 st.write(f"**Signals:** {selected_row['High Conviction Flag']}")
-                st.write(f"**60D Return:** {selected_row['60D Return']} | **180D Return:** {selected_row['180D Return']}")
+                st.write(f"**60D Alpha:** {selected_row['60D Alpha']} | **180D Alpha:** {selected_row['180D Alpha']}")
             with col_b:
                 st.markdown("**Scoring Audit Trail:**")
                 components = selected_row["Score Breakdown"].split(" | ")
@@ -595,61 +639,116 @@ if not df.empty:
                     st.markdown(f"- {comp}")
         else:
             st.info("👆 Click any row in the table above to inspect its exact scoring breakdown and audit trail.")
+    else:
+        st.warning("No transactions found for the selected filters.")
 
-    with tab2:
-        st.subheader("🏆 Aggregate Insider Directory & Track Record")
-        leaderboard_source = df.copy()
+with tab2:
+    st.subheader("🕵️ Recent Buyers & Historical Track Record")
+    st.write("Sorted by **Most Recent Purchase** so you can vet active buyers against their matured 60D & 180D benchmark alpha.")
 
-        if not leaderboard_source.empty:
-            search_query = st.text_input("🔍 Search by Purchaser Name or Ticker:", "")
+    dir_raw = load_full_history_for_directory(limit_rows=2500)
+    dir_source = filter_out_institutions(dir_raw, hide_institutions)
 
-            agg_df = (
-                leaderboard_source.groupby("insider_name")
-                .agg({
-                    "ticker": lambda x: ", ".join(x.unique()),
-                    "shares_bought": "sum",
-                    "est_value": "sum",
-                    "Unrealized Profit ($)": "sum",
-                    "Alpha Return (%)": "mean",
-                    "transaction_date": "count"
-                })
-                .reset_index()
-            )
-            agg_df.columns = ["Insider Name", "Tickers Traded", "Total Shares", "Total Invested ($)", "Net Profit/Loss ($)", "Avg Alpha vs Benchmark (%)", "Total Trades"]
+    if not dir_source.empty:
+        search_query = st.text_input("🔍 Search by Purchaser Name or Ticker:", "", key="dir_search")
 
-            agg_df["Cumulative ROI (%)"] = (agg_df["Net Profit/Loss ($)"] / agg_df["Total Invested ($)"]) * 100.0
+        # Group by insider_name across full history
+        grouped_records = []
+        for insider, grp in dir_source.groupby("insider_name"):
+            grp_sorted = grp.sort_values(by="parsed_date", ascending=False)
+            latest_tx_date = str(grp_sorted["transaction_date"].iloc[0])[:10]
+            latest_ticker = grp_sorted["ticker"].iloc[0]
+            all_tickers = ", ".join(grp_sorted["ticker"].unique())
+            total_trades = len(grp_sorted)
+            total_invested = grp_sorted["est_value"].sum()
+            net_profit = grp_sorted["Unrealized Profit ($)"].sum()
+            avg_current_alpha = grp_sorted["Alpha Return (%)"].mean()
 
-            if search_query:
-                q = search_query.upper()
-                agg_df = agg_df[
-                    agg_df["Insider Name"].str.upper().str.contains(q, na=False) |
-                    agg_df["Tickers Traded"].str.upper().str.contains(q, na=False)
-                ]
+            # Evaluate matured 60D and 180D alphas
+            matured_60 = grp_sorted["alpha_60d_num"].dropna()
+            matured_180 = grp_sorted["alpha_180d_num"].dropna()
 
-            agg_df["Total Invested ($)"] = agg_df["Total Invested ($)"].apply(lambda x: f"${x:,.0f}")
-            agg_df["Net Profit/Loss ($)"] = agg_df["Net Profit/Loss ($)"].apply(lambda x: f"+${x:,.0f}" if x >= 0 else f"-${abs(x):,.0f}")
-            agg_df["Avg Alpha vs Benchmark (%)"] = agg_df["Avg Alpha vs Benchmark (%)"].apply(lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%")
+            avg_60_alpha = matured_60.mean() if not matured_60.empty else None
+            avg_180_alpha = matured_180.mean() if not matured_180.empty else None
+            matured_trade_count = len(grp_sorted[grp_sorted["alpha_60d_num"].notnull() | grp_sorted["alpha_180d_num"].notnull()])
 
-            p_event = st.dataframe(
-                agg_df.sort_values(by="Total Trades", ascending=False),
-                use_container_width=True,
-                on_select="rerun",
-                selection_mode="single-row",
-                key="purchaser_table_selection"
-            )
-
-            p_selected_indices = p_event.get("selection", {}).get("rows", [])
-            if len(p_selected_indices) > 0:
-                sorted_agg = agg_df.sort_values(by="Total Trades", ascending=False).reset_index(drop=True)
-                chosen_purchaser = sorted_agg.iloc[p_selected_indices[0]]["Insider Name"]
-
-                st.markdown(f"### 📄 Trade History for: {chosen_purchaser}")
-                purchaser_trades = leaderboard_source[leaderboard_source["insider_name"] == chosen_purchaser][[
-                    "transaction_date", "ticker", "Conviction Score", "Conviction Tier", 
-                    "Shares Bought", "Est. Value ($)", "Total Return", "Alpha Return"
-                ]]
-                st.dataframe(purchaser_trades, use_container_width=True)
+            # Determine Track Record Rating Badge (requires >= 2 matured trades)
+            if matured_trade_count < 2:
+                rating = "⏳ No Mature Data"
             else:
-                st.info("👆 Click any purchaser row above to view their full chronological trade history and performance.")
-else:
-    st.warning("No transactions found for the selected filters.")
+                # Combine available matured alphas (preferring 180D if available, blended with 60D)
+                valid_horizon_means = [x for x in [avg_60_alpha, avg_180_alpha] if x is not None]
+                blended_horizon_alpha = sum(valid_horizon_means) / len(valid_horizon_means)
+
+                if blended_horizon_alpha >= 5.0:
+                    rating = "🏆 Strong Performer"
+                elif blended_horizon_alpha >= -2.0:
+                    rating = "⚖️ Medium Performer"
+                else:
+                    rating = "📉 Poor Performer"
+
+            grouped_records.append({
+                "Latest Purchase": latest_tx_date,
+                "Insider Name": insider,
+                "Track Record Rating": rating,
+                "Latest Ticker": latest_ticker,
+                "All Tickers": all_tickers,
+                "Total Trades": total_trades,
+                "Matured Trades": matured_trade_count,
+                "Avg 60D Alpha": f"+{avg_60_alpha:.1f}%" if avg_60_alpha is not None and avg_60_alpha >= 0 else (f"{avg_60_alpha:.1f}%" if avg_60_alpha is not None else "N/A"),
+                "Avg 180D Alpha": f"+{avg_180_alpha:.1f}%" if avg_180_alpha is not None and avg_180_alpha >= 0 else (f"{avg_180_alpha:.1f}%" if avg_180_alpha is not None else "N/A"),
+                "Total Invested ($)": f"${total_invested:,.0f}",
+                "Current Net P/L ($)": f"+${net_profit:,.0f}" if net_profit >= 0 else f"-${abs(net_profit):,.0f}",
+                "Avg Current Alpha": f"+{avg_current_alpha:.1f}%" if avg_current_alpha >= 0 else f"{avg_current_alpha:.1f}%",
+            })
+
+        agg_df = pd.DataFrame(grouped_records)
+
+        if search_query:
+            q = search_query.upper()
+            agg_df = agg_df[
+                agg_df["Insider Name"].str.upper().str.contains(q, na=False) |
+                agg_df["All Tickers"].str.upper().str.contains(q, na=False)
+            ]
+
+        # Sort by Latest Purchase descending so recent buyers appear at the top
+        agg_df = agg_df.sort_values(by="Latest Purchase", ascending=False).reset_index(drop=True)
+
+        p_event = st.dataframe(
+            agg_df,
+            use_container_width=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key="purchaser_table_selection"
+        )
+
+        p_selected_indices = p_event.get("selection", {}).get("rows", [])
+        if len(p_selected_indices) > 0:
+            chosen_row = agg_df.iloc[p_selected_indices[0]]
+            chosen_purchaser = chosen_row["Insider Name"]
+
+            st.markdown("---")
+            st.markdown(f"### 📄 Full Trade History & Horizon Alpha: {chosen_purchaser}")
+
+            # Summary Scorecard at the bottom for the selected buyer
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Track Record Rating", chosen_row["Track Record Rating"])
+            m2.metric("Matured Trades (60D+)", f"{chosen_row['Matured Trades']} of {chosen_row['Total Trades']}")
+            m3.metric("Avg 60D Alpha vs Benchmark", chosen_row["Avg 60D Alpha"])
+            m4.metric("Avg 180D Alpha vs Benchmark", chosen_row["Avg 180D Alpha"])
+
+            purchaser_trades = dir_source[dir_source["insider_name"] == chosen_purchaser].sort_values(
+                by="parsed_date", ascending=False
+            )[[
+                "transaction_date", "ticker", "Conviction Score", "Conviction Tier", 
+                "Shares Bought", "Est. Value ($)", "Total Return", "Alpha Return", "60D Alpha", "180D Alpha"
+            ]]
+            purchaser_trades.columns = [
+                "Transaction Date", "Ticker", "Score", "Tier", 
+                "Shares Bought", "Est. Value ($)", "Current Return", "Current Alpha", "60D Alpha", "180D Alpha"
+            ]
+            st.dataframe(purchaser_trades, use_container_width=True)
+        else:
+            st.info("👆 Click any recent buyer row above to inspect their full trade history, 60D/180D benchmark alpha, and track record scorecard.")
+    else:
+        st.warning("No historical data available.")
