@@ -266,7 +266,7 @@ def process_advanced_conviction_metrics(df):
 
 
 def enrich_dataframe(df):
-    """Applies grouping, performance calculations, and formatting to a raw trades DataFrame."""
+    """Applies live YFinance performance calculations, conviction scoring, and formatting."""
     if df.empty:
         return df
 
@@ -277,24 +277,22 @@ def enrich_dataframe(df):
         "shares_bought": "sum",
         "shares_owned_following": "last",
         "est_value": "sum",
-        "activity_type": "first",
         "market_cap": "first",
         "market_cap_category": "first",
         "benchmark_ticker": "first",
-        "price_at_tx": "first",
-        "price_60d_after": "first",
-        "price_180d_after": "first",
         "return_60d_pct": "first",
         "return_180d_pct": "first",
         "bench_return_60d_pct": "first",
         "bench_return_180d_pct": "first",
     }
-    df = df.groupby(group_cols, as_index=False).agg(agg_rules)
+    # Keep only columns that exist in df
+    active_agg = {k: v for k, v in agg_rules.items() if k in df.columns}
+    df = df.groupby(group_cols, as_index=False).agg(active_agg)
 
     df["sector"] = df.apply(
         lambda row: get_stock_sector(row["ticker"])
-        if row["sector"] in ["Unclassified", None, ""]
-        else row["sector"],
+        if row.get("sector") in ["Unclassified", None, ""]
+        else row.get("sector", "Unclassified"),
         axis=1,
     )
 
@@ -364,7 +362,6 @@ def enrich_dataframe(df):
     df["Unrealized Gain"] = df.apply(format_gain, axis=1)
     df["Total Return"] = df.apply(format_return, axis=1)
 
-    # --- COMPUTE 60D & 180D ALPHA DIRECTLY FROM SUPABASE PRE-COMPUTED COLUMNS ---
     def compute_horizon_alpha(row, stock_ret_col, bench_ret_col, days_required):
         s_ret = row.get(stock_ret_col)
         b_ret = row.get(bench_ret_col)
@@ -424,9 +421,8 @@ def load_filtered_feed(selected_year, selected_month, max_rows):
 
         query = f"""
             SELECT transaction_date, ticker, sector, insider_name, insider_title, 
-                   shares_bought, shares_owned_following, est_value, activity_type,
+                   shares_bought, shares_owned_following, est_value,
                    market_cap, market_cap_category, benchmark_ticker,
-                   price_at_tx, price_60d_after, price_180d_after,
                    return_60d_pct, return_180d_pct, bench_return_60d_pct, bench_return_180d_pct
             FROM insider_trades 
             {where_sql}
@@ -442,14 +438,13 @@ def load_filtered_feed(selected_year, selected_month, max_rows):
 
 @st.cache_data(ttl=600)
 def load_full_history_for_directory(limit_rows=2500):
-    """Loads broader historical window so Tab 2 shows full track records regardless of Tab 1 month/year filters."""
+    """Fast load using ONLY pre-computed Supabase columns (zero live yfinance calls) so Tab 2 loads instantaneously."""
     conn = get_db_connection()
     try:
         query = f"""
             SELECT transaction_date, ticker, sector, insider_name, insider_title, 
-                   shares_bought, shares_owned_following, est_value, activity_type,
+                   shares_bought, shares_owned_following, est_value,
                    market_cap, market_cap_category, benchmark_ticker,
-                   price_at_tx, price_60d_after, price_180d_after,
                    return_60d_pct, return_180d_pct, bench_return_60d_pct, bench_return_180d_pct
             FROM insider_trades 
             ORDER BY transaction_date DESC
@@ -459,7 +454,45 @@ def load_full_history_for_directory(limit_rows=2500):
     finally:
         conn.close()
 
-    return enrich_dataframe(df)
+    if df.empty:
+        return df
+
+    df = df.groupby(["transaction_date", "ticker", "insider_name"], as_index=False).agg({
+        "sector": "first",
+        "insider_title": "first",
+        "shares_bought": "sum",
+        "shares_owned_following": "last",
+        "est_value": "sum",
+        "market_cap": "first",
+        "market_cap_category": "first",
+        "benchmark_ticker": "first",
+        "return_60d_pct": "first",
+        "return_180d_pct": "first",
+        "bench_return_60d_pct": "first",
+        "bench_return_180d_pct": "first",
+    })
+
+    df["parsed_date"] = pd.to_datetime(df["transaction_date"].astype(str).str[:10])
+    current_date = pd.Timestamp.now().normalize()
+
+    def compute_horizon_alpha(row, stock_ret_col, bench_ret_col, days_required):
+        s_ret = row.get(stock_ret_col)
+        b_ret = row.get(bench_ret_col)
+        if pd.notnull(s_ret) and pd.notnull(b_ret):
+            alpha_val = float(s_ret) - float(b_ret)
+            return alpha_val, (f"+{alpha_val:.1f}%" if alpha_val >= 0 else f"{alpha_val:.1f}%")
+        days_elapsed = (current_date - row["parsed_date"]).days
+        return None, ("Pending" if days_elapsed < days_required else "N/A")
+
+    a60 = df.apply(lambda r: compute_horizon_alpha(r, "return_60d_pct", "bench_return_60d_pct", 60), axis=1)
+    df["alpha_60d_num"] = [x[0] for x in a60]
+    df["60D Alpha"] = [x[1] for x in a60]
+
+    a180 = df.apply(lambda r: compute_horizon_alpha(r, "return_180d_pct", "bench_return_180d_pct", 180), axis=1)
+    df["alpha_180d_num"] = [x[0] for x in a180]
+    df["180D Alpha"] = [x[1] for x in a180]
+
+    return df
 
 
 def filter_out_institutions(df, hide_flag):
@@ -652,7 +685,6 @@ with tab2:
     if not dir_source.empty:
         search_query = st.text_input("🔍 Search by Purchaser Name or Ticker:", "", key="dir_search")
 
-        # Group by insider_name across full history
         grouped_records = []
         for insider, grp in dir_source.groupby("insider_name"):
             grp_sorted = grp.sort_values(by="parsed_date", ascending=False)
@@ -661,10 +693,7 @@ with tab2:
             all_tickers = ", ".join(grp_sorted["ticker"].unique())
             total_trades = len(grp_sorted)
             total_invested = grp_sorted["est_value"].sum()
-            net_profit = grp_sorted["Unrealized Profit ($)"].sum()
-            avg_current_alpha = grp_sorted["Alpha Return (%)"].mean()
 
-            # Evaluate matured 60D and 180D alphas
             matured_60 = grp_sorted["alpha_60d_num"].dropna()
             matured_180 = grp_sorted["alpha_180d_num"].dropna()
 
@@ -672,11 +701,9 @@ with tab2:
             avg_180_alpha = matured_180.mean() if not matured_180.empty else None
             matured_trade_count = len(grp_sorted[grp_sorted["alpha_60d_num"].notnull() | grp_sorted["alpha_180d_num"].notnull()])
 
-            # Determine Track Record Rating Badge (requires >= 2 matured trades)
             if matured_trade_count < 2:
                 rating = "⏳ No Mature Data"
             else:
-                # Combine available matured alphas (preferring 180D if available, blended with 60D)
                 valid_horizon_means = [x for x in [avg_60_alpha, avg_180_alpha] if x is not None]
                 blended_horizon_alpha = sum(valid_horizon_means) / len(valid_horizon_means)
 
@@ -698,8 +725,6 @@ with tab2:
                 "Avg 60D Alpha": f"+{avg_60_alpha:.1f}%" if avg_60_alpha is not None and avg_60_alpha >= 0 else (f"{avg_60_alpha:.1f}%" if avg_60_alpha is not None else "N/A"),
                 "Avg 180D Alpha": f"+{avg_180_alpha:.1f}%" if avg_180_alpha is not None and avg_180_alpha >= 0 else (f"{avg_180_alpha:.1f}%" if avg_180_alpha is not None else "N/A"),
                 "Total Invested ($)": f"${total_invested:,.0f}",
-                "Current Net P/L ($)": f"+${net_profit:,.0f}" if net_profit >= 0 else f"-${abs(net_profit):,.0f}",
-                "Avg Current Alpha": f"+{avg_current_alpha:.1f}%" if avg_current_alpha >= 0 else f"{avg_current_alpha:.1f}%",
             })
 
         agg_df = pd.DataFrame(grouped_records)
@@ -711,7 +736,6 @@ with tab2:
                 agg_df["All Tickers"].str.upper().str.contains(q, na=False)
             ]
 
-        # Sort by Latest Purchase descending so recent buyers appear at the top
         agg_df = agg_df.sort_values(by="Latest Purchase", ascending=False).reset_index(drop=True)
 
         p_event = st.dataframe(
@@ -730,16 +754,17 @@ with tab2:
             st.markdown("---")
             st.markdown(f"### 📄 Full Trade History & Horizon Alpha: {chosen_purchaser}")
 
-            # Summary Scorecard at the bottom for the selected buyer
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Track Record Rating", chosen_row["Track Record Rating"])
             m2.metric("Matured Trades (60D+)", f"{chosen_row['Matured Trades']} of {chosen_row['Total Trades']}")
             m3.metric("Avg 60D Alpha vs Benchmark", chosen_row["Avg 60D Alpha"])
             m4.metric("Avg 180D Alpha vs Benchmark", chosen_row["Avg 180D Alpha"])
 
-            purchaser_trades = dir_source[dir_source["insider_name"] == chosen_purchaser].sort_values(
-                by="parsed_date", ascending=False
-            )[[
+            # Enrich ONLY the selected buyer's trades on demand (fast!)
+            raw_buyer_df = dir_source[dir_source["insider_name"] == chosen_purchaser].copy()
+            enriched_buyer_df = enrich_dataframe(raw_buyer_df).sort_values(by="parsed_date", ascending=False)
+
+            purchaser_trades = enriched_buyer_df[[
                 "transaction_date", "ticker", "Conviction Score", "Conviction Tier", 
                 "Shares Bought", "Est. Value ($)", "Total Return", "Alpha Return", "60D Alpha", "180D Alpha"
             ]]
