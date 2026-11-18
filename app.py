@@ -333,7 +333,8 @@ try:
     query = f"""
         SELECT transaction_date, ticker, sector, insider_name, insider_title, 
                shares_bought, shares_owned_following, est_value, activity_type,
-               market_cap, market_cap_category, benchmark_ticker
+               market_cap, market_cap_category, benchmark_ticker,
+               price_at_tx, price_60d_after, price_180d_after
         FROM insider_trades 
         {where_sql}
         ORDER BY transaction_date DESC
@@ -355,6 +356,9 @@ try:
             "market_cap": "first",
             "market_cap_category": "first",
             "benchmark_ticker": "first",
+            "price_at_tx": "first",
+            "price_60d_after": "first",
+            "price_180d_after": "first",
         }
         df = df.groupby(group_cols, as_index=False).agg(agg_rules)
 
@@ -429,7 +433,7 @@ try:
 
         df["Conviction Tier"] = df["Conviction Score"].apply(assign_tier_label)
 
-        current_date = pd.to_datetime("2026-11-10")
+        current_date = pd.Timestamp.now().normalize()
 
         def format_gain(row):
             profit = row["Unrealized Profit ($)"]
@@ -449,6 +453,28 @@ try:
 
         df["Unrealized Gain"] = df.apply(format_gain, axis=1)
         df["Total Return"] = df.apply(format_return, axis=1)
+
+        # Helper function for 60D & 180D forward return calculations
+        def format_forward_return(row, target_col, days_required):
+            p_tx = row.get("price_at_tx")
+            p_target = row.get(target_col)
+            tx_date = pd.to_datetime(str(row["transaction_date"])[:10])
+
+            if pd.isnull(p_tx) or pd.isnull(p_target) or p_tx <= 0:
+                days_elapsed = (current_date - tx_date).days
+                if days_elapsed < days_required:
+                    return "Pending"
+                return "N/A"
+
+            ret = ((p_target - p_tx) / p_tx) * 100.0
+            return f"+{ret:.1f}%" if ret >= 0 else f"{ret:.1f}%"
+
+        df["60D Return"] = df.apply(
+            lambda r: format_forward_return(r, "price_60d_after", 60), axis=1
+        )
+        df["180D Return"] = df.apply(
+            lambda r: format_forward_return(r, "price_180d_after", 180), axis=1
+        )
 
         df["Benchmark Return"] = df["Benchmark Return (%)"].apply(
             lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
@@ -471,11 +497,11 @@ try:
         st.sidebar.markdown("---")
         st.sidebar.markdown("### 📖 Signal & Tier Legend")
         st.sidebar.markdown("""
-        * **⭐ Executive Consensus (70+)**: Top-tier cluster buying & skin-in-the-game.
-        * **🟢 High Conviction (50-69)**: Strong standalone executive purchase.
-        * **🔥** **Cluster Consensus** (2+ distinct C-Suite/execs buying within 30 days)
-        * **⚡** **Operational Leadership** (CEO, CFO, or COO purchase $\ge \$100k$)
-        * **🚀** **Skin-in-the-Game** ($\ge 25\%$ personal position expansion, $\ge \$50k$)
+- **⭐ Executive Consensus (70+)**: Top-tier cluster buying & skin-in-the-game.
+- **🟢 High Conviction (50-69)**: Strong standalone executive purchase.
+- **🔥** **Cluster Consensus** (2+ distinct C-Suite/execs buying within 30 days)
+- **⚡** **Operational Leadership** (CEO, CFO, or COO purchase $\ge \$100k$)
+- **🚀** **Skin-in-the-Game** ($\ge 25\%$ personal position expansion, $\ge \$50k$)
         """)
 
         st.sidebar.markdown("---")
@@ -519,7 +545,6 @@ try:
 
             st.subheader("📋 Insider Transactions Database")
 
-            # Clean table with separate numeric Score and visual Tier badge
             display_df = display_source[[
                 "transaction_date",
                 "Conviction Score",
@@ -533,6 +558,8 @@ try:
                 "Est. Value ($)",
                 "Unrealized Gain",
                 "Total Return",
+                "60D Return",
+                "180D Return",
                 "Market Cap at Tx",
                 "market_cap_category",
                 "benchmark_ticker",
@@ -553,6 +580,8 @@ try:
                 "Est. Value ($)",
                 "Unrealized Gain (Inc. Divs)",
                 "Total Return",
+                "60D Return",
+                "180D Return",
                 "Market Cap at Tx",
                 "Market Cap Tier",
                 "Benchmark",
@@ -588,6 +617,7 @@ try:
                     st.metric("Conviction Score", f"{selected_row['Conviction Score']} / 100")
                     st.write(f"**Tier:** {selected_row['Conviction Tier']}")
                     st.write(f"**Signals:** {selected_row['High Conviction Flag']}")
+                    st.write(f"**60D Return:** {selected_row['60D Return']} | **180D Return:** {selected_row['180D Return']}")
                 with col_b:
                     st.markdown("**Scoring Audit Trail:**")
                     components = selected_row["Score Breakdown"].split(" | ")
@@ -689,18 +719,7 @@ try:
                         ]],
                         use_container_width=True,
                     )
-            else:
-                st.info(
-                    "No equity insider trades available for leaderboard calculation."
-                )
-    else:
-        st.info("No insider transactions found for the selected filter.")
 
-except Exception as e:
-    st.error(f"Error connecting to database or fetching data: {e}")
 finally:
     if conn:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        conn.close()
