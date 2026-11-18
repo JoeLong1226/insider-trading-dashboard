@@ -43,7 +43,7 @@ def fetch_prices_for_date(ticker_symbol, tx_date_str):
              
         hist.index = hist.index.date
 
-        # 1. Price at transaction date (fallback close proxy if needed, though Form 4 takes precedence if available)
+        # 1. Price at transaction date
         if tx_date in hist.index:
             price_at_tx = float(hist.loc[tx_date, 'Close'])
         else:
@@ -77,7 +77,6 @@ def update_missing_prices(start_date_filter="2026-04-01", end_date_filter="2026-
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    # AUDITOR FIX: Target all records in the window so we can reconcile/refresh them cleanly
     select_query = """
         SELECT id, ticker, transaction_date, est_value, shares_bought 
         FROM insider_trades 
@@ -97,16 +96,12 @@ def update_missing_prices(start_date_filter="2026-04-01", end_date_filter="2026-
 
     updated_count = 0
     for row_id, ticker, tx_date, est_value, shares_bought in rows:
-        # 1. Prioritize official Form 4 execution price if available (est_value / shares)
         official_price = None
         if est_value and shares_bought and shares_bought > 0:
             official_price = round(float(est_value) / float(shares_bought), 2)
 
-        # 2. Fetch forward prices via yfinance
-        _, price_60d, price_180d = fetch_prices_for_date(ticker, str(tx_date))
-        
-        # Use official Form 4 price for transaction date, falling back to yfinance if needed
-        final_tx_price = official_price if official_price else _
+        tx_p, price_60d, price_180d = fetch_prices_for_date(ticker, str(tx_date))
+        final_tx_price = official_price if official_price else tx_p
 
         if final_tx_price is not None:
             try:
@@ -130,4 +125,7 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3:
         update_missing_prices(sys.argv[1], sys.argv[2])
     else:
-        update_missing_prices("2026-04-01", "2026-04-30")
+        end_dt = datetime.utcnow().date()
+        start_dt = end_dt - timedelta(days=180)
+        print(f"No date arguments provided. Running dynamic window: {start_dt} to {end_dt}")
+        update_missing_prices(start_dt.strftime('%Y-%m-%d'), end_dt.strftime('%Y-%m-%d'))
