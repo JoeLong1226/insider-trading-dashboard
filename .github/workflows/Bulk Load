@@ -1,0 +1,55 @@
+name: Bulk Load History
+
+on:
+  workflow_dispatch:
+    inputs:
+      quarters:
+        description: 'Quarters to load, space separated (e.g. 2025q1 or 2024q1 2024q2)'
+        required: true
+        default: '2025q1'
+        type: string
+      dry_run:
+        description: 'Dry run: parse and print counts only, write nothing'
+        required: false
+        default: true
+        type: boolean
+      no_market_data:
+        description: 'Skip yfinance (much faster; market cap stays Unknown)'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: bulk-load
+  cancel-in-progress: false
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bulk loader
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          QUARTERS: ${{ github.event.inputs.quarters }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          NO_MD: ${{ github.event.inputs.no_market_data }}
+        run: |
+          ARGS=($QUARTERS)
+          if [ "$DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
+          if [ "$NO_MD" = "true" ]; then ARGS+=(--no-market-data); fi
+          python bulk_load.py "${ARGS[@]}"
