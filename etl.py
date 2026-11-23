@@ -8,6 +8,10 @@ Usage:
 
 Daily/range sweeps are "fill the gaps" runs: before inserting, they check whether a row for the same
 ticker + insider + transaction date already exists (e.g. from your backfill) and skip it if so.
+
+After any run that inserts or replaces rows, the database function refresh_dq() is called. It
+normalizes new rows, picks one canonical row per event, and recomputes the data-quality flags that
+the website views (insider_trades_public / insider_trades_open_market) rely on.
 """
 import os
 import re
@@ -28,6 +32,10 @@ SUPABASE_URL = os.environ.get("SUPABASE_DB_URL")
 
 MIN_VALUE = 50_000
 EASTERN = ZoneInfo("America/New_York")
+
+# CHANGED (1 of 3): raw trading-symbol values that mean "no ticker". These must be checked BEFORE
+# clean_ticker_for_yf(), which splits on "/" and used to turn "N/A" into the bogus ticker "N".
+PLACEHOLDER_SYMBOLS = {"N/A", "NONE", "NULL", "[NONE]", "UNKNOWN", "-", ""}
 
 
 def get_db_connection():
@@ -332,6 +340,23 @@ def mark_processed(cursor, acc, form_type):
         "ON CONFLICT DO NOTHING;", (acc, form_type))
 
 
+# CHANGED (2 of 3): run the database-side quality pass after new rows land.
+def refresh_quality(cursor, conn, stats):
+    """Calls refresh_dq(): normalizes new rows, picks one canonical row per event, recomputes flags.
+
+    If this fails the run is marked as failed (red in GitHub), because un-flagged rows would
+    otherwise appear on the website.
+    """
+    try:
+        cursor.execute("SELECT refresh_dq();")
+        conn.commit()
+        print("refresh_dq() completed.")
+    except Exception as e:
+        conn.rollback()
+        stats['db_errors'] += 1
+        print(f"*** refresh_dq() FAILED: {type(e).__name__}: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Parsing + processing
 # ---------------------------------------------------------------------------
@@ -397,9 +422,14 @@ def process_filing(entry, seen, cursor, conn, stats, guard=False):
         print(f"  bad XML in {acc}: {pe}")
         return done('bad_xml')
 
+    # CHANGED (3 of 3): look at the RAW symbol first; skip placeholders like "N/A" instead of
+    # letting clean_ticker_for_yf() turn them into the bogus ticker "N".
     ticker = "NONE"
     for tag in [".//issuerTradingSymbol", ".//tradingSymbol", ".//symbol"]:
-        cleaned = clean_ticker_for_yf(root.findtext(tag))
+        raw = (root.findtext(tag) or "").strip().upper()
+        if raw in PLACEHOLDER_SYMBOLS:
+            continue
+        cleaned = clean_ticker_for_yf(raw)
         if cleaned and re.match(r'^[A-Z\-\.]{1,6}$', cleaned):
             ticker = cleaned
             break
@@ -522,6 +552,10 @@ def main():
             print(f"=== Daily sweep for {day} ===")
             entries = [e for e in fetch_daily_entries(day) if e['accession_number'] not in seen]
             run_batch(entries, seen, cursor, conn, stats, guard=True)
+
+    # CHANGED (2 of 3, continued): only when something actually changed in the table
+    if stats['inserted'] or stats['replaced']:
+        refresh_quality(cursor, conn, stats)
 
     cursor.close()
     conn.close()
