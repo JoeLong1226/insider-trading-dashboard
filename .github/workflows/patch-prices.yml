@@ -5,9 +5,15 @@ on:
   schedule:
     - cron: '0 2 * * *' # Runs automatically every day at 2:00 AM UTC
 
+# Share the lock with the live ETL so the two never write to the table at the same time
+concurrency:
+  group: insider-etl
+  cancel-in-progress: false
+
 jobs:
   patch:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -26,3 +32,9 @@ jobs:
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: python patch_prices.py
+
+      - name: Refresh data-quality flags
+        if: always()
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python -c "import os, psycopg2; c = psycopg2.connect(os.environ['SUPABASE_DB_URL']); cur = c.cursor(); cur.execute('SELECT refresh_dq();'); c.commit(); print('refresh_dq done')"
