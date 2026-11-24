@@ -1,0 +1,49 @@
+name: Enrich New Rows
+
+on:
+  workflow_dispatch:
+    inputs:
+      all_rows:
+        description: "Enrich ANY visible row with an empty market cap (not just backfilled rows)? yes/no"
+        required: true
+        default: "no"
+
+# Share the lock with the live ETL and Patch Prices so nothing writes at the same time
+concurrency:
+  group: insider-etl
+  cancel-in-progress: false
+
+jobs:
+  enrich:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Fill market cap, tier, benchmark and sector
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          if [ "${{ github.event.inputs.all_rows }}" = "yes" ]; then
+            python enrich_new_rows.py --all
+          else
+            python enrich_new_rows.py
+          fi
+
+      # market cap feeds several quality rules, so re-run them even if the step above stopped early
+      - name: Refresh data-quality flags
+        if: always()
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python -c "import os, psycopg2; c = psycopg2.connect(os.environ['SUPABASE_DB_URL']); cur = c.cursor(); cur.execute('SELECT refresh_dq();'); c.commit(); print('refresh_dq done')"
