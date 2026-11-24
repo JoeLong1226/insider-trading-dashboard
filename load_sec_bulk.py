@@ -42,7 +42,7 @@ URLS = [
 DEFAULT_QUARTERS = "2025q4,2026q1,2026q2,2026q3"
 MIN_VALUE = 50_000
 
-PLACEHOLDER_SYMBOLS = {"", "NONE", "N/A", "NA", "NULL", "[NONE]", "UNKNOWN", "-"}
+PLACEHOLDER_SYMBOLS = {"", "NONE", "N/A", "N.A.", "NA", "NULL", "[NONE]", "UNKNOWN", "-"}
 OFFERING_RE = re.compile(
     r"public offering|private placement|initial public offering|\bIPO\b|underwritten|"
     r"follow-on|registered direct|\bPIPE\b|subscription agreement|securities purchase agreement|"
@@ -239,13 +239,35 @@ def read_tsv(zf, basename):
 # Transform
 # ---------------------------------------------------------------------------
 def clean_symbol(raw):
-    """'LEN, LEN.B' -> 'LEN'; 'NYSE:FLG' -> 'FLG'; 'NONE' / 'N/A' -> None (never 'N')."""
+    """Turn the SEC's free-text symbol into one Yahoo-style ticker, or None.
+    'LEN, LEN.B' -> 'LEN'   'N O G' -> 'NOG'   'CLBR U' -> 'CLBRU'   'BRK.B' -> 'BRK-B'
+    'BF/B' -> 'BF-B'        'NVRI WI' -> 'NVRI'   'NONE' / 'N/A' / 'N.A.' -> None (never 'N')."""
     s = str(raw or "").strip().upper()
     if s in PLACEHOLDER_SYMBOLS:
         return None
-    s = re.sub(r"^.*:", "", s)
-    s = re.split(r"[,;/\s]+", s)[0].strip()
-    return None if s in PLACEHOLDER_SYMBOLS else s
+    s = re.sub(r"^.*:", "", s)                      # 'NYSE:FLG' -> 'FLG'
+    s = re.split(r"[,;]+", s)[0].strip()            # several tickers: keep the first
+    if re.fullmatch(r"[A-Z]{1,5}/[A-Z]", s):        # share class written with a slash
+        s = s.replace("/", "-")
+    toks = s.split()
+    if not toks:
+        return None
+    if len(toks) > 1:
+        if all(len(t) == 1 for t in toks):          # letters spaced out: 'N O G'
+            s = "".join(toks)
+        elif toks[0] == "OTC":
+            s = toks[1]
+        elif len(toks[1]) == 1:                     # unit / class suffix: 'CLBR U'
+            s = toks[0] + toks[1]
+        else:                                       # 'CRDA CRDB', 'NVRI WI': first one
+            s = toks[0]
+    else:
+        s = toks[0]
+    s = s.split("/")[0]
+    if s in PLACEHOLDER_SYMBOLS:
+        return None
+    s = s.replace(".", "-")                         # Yahoo style, same as the site
+    return None if s in PLACEHOLDER_SYMBOLS or not s else s
 
 
 def parse_date(series):
