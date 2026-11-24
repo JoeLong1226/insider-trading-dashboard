@@ -33,8 +33,12 @@ import requests
 
 # SEC requires a descriptive User-Agent with a contact email (same as etl.py)
 HEADERS = {"User-Agent": "InsiderTradingApp JosephLong1226@gmail.com"}
-URL = ("https://www.sec.gov/files/datastandardsinnovation/data/"
-       "insider-transactions-data-sets/{q}_form345.zip")
+# The SEC moved these files between folders (2025q4/2026q1 are under /structureddata/,
+# newer quarters under /datastandardsinnovation/). Try each in turn.
+URLS = [
+    "https://www.sec.gov/files/datastandardsinnovation/data/insider-transactions-data-sets/{q}_form345.zip",
+    "https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/{q}_form345.zip",
+]
 DEFAULT_QUARTERS = "2025q4,2026q1,2026q2,2026q3"
 MIN_VALUE = 50_000
 
@@ -198,24 +202,27 @@ def fetch_zip(quarter, zip_dir):
     path = os.path.join(zip_dir, f"{quarter}_form345.zip")
     if os.path.exists(path) and zipfile.is_zipfile(path):
         return path
-    url = URL.format(q=quarter)
     last = None
-    for attempt in range(1, 4):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=180, stream=True)
-            if r.status_code == 404:
-                raise RuntimeError(f"{url} -> 404 (not published yet, or the name differs)")
-            r.raise_for_status()
-            with open(path, "wb") as f:
-                for chunk in r.iter_content(1 << 20):
-                    f.write(chunk)
-            if not zipfile.is_zipfile(path):
-                raise RuntimeError("download is not a zip (SEC may have blocked the request)")
-            return path
-        except Exception as e:                      # noqa: BLE001
-            last = e
-            print(f"  attempt {attempt}/3 for {quarter} failed: {e}")
-            time.sleep(5 * attempt)
+    for template in URLS:
+        url = template.format(q=quarter)
+        for attempt in range(1, 4):
+            try:
+                r = requests.get(url, headers=HEADERS, timeout=180, stream=True)
+                if r.status_code == 404:
+                    last = f"{url} -> 404"
+                    break                       # wrong folder: try the next address, no retries
+                r.raise_for_status()
+                with open(path, "wb") as f:
+                    for chunk in r.iter_content(1 << 20):
+                        f.write(chunk)
+                if not zipfile.is_zipfile(path):
+                    raise RuntimeError("download is not a zip (SEC may have blocked the request)")
+                print(f"  downloaded from {url}")
+                return path
+            except Exception as e:              # noqa: BLE001
+                last = e
+                print(f"  attempt {attempt}/3 for {quarter} failed: {e}")
+                time.sleep(5 * attempt)
     raise RuntimeError(f"could not download {quarter}: {last}")
 
 
