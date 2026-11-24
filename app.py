@@ -5,6 +5,10 @@ import psycopg2
 import streamlit as st
 import yfinance as yf
 
+# The site reads ONLY from this view: canonical rows, hard-quality-flagged rows removed,
+# open-market purchases only. Never point it back at the raw insider_trades table.
+SOURCE_VIEW = "insider_trades_open_market"
+
 st.set_page_config(
     page_title="Insider Transactions Dashboard",
     layout="wide",
@@ -43,16 +47,26 @@ def get_stock_sector(ticker):
     return "Unclassified"
 
 
+NO_PERF = (None, None, None, None, None)
+
+
 @st.cache_data(ttl=86400)
-def calculate_trade_performance(
-    ticker, benchmark_ticker, tx_date_str, shares, est_value_db
-):
+def calculate_trade_performance(ticker, benchmark_ticker, tx_date_str, shares):
+    """Return (dollar_return, pct_return, price_30d_change_pct, bench_pct, alpha_pct).
+
+    Any value that cannot be computed is None (shown as N/A), never 0.0:
+    0.0 would be indistinguishable from a real 0% return.
+
+    Uses UNADJUSTED closes so the base price matches the share count in the filing,
+    and adds dividends separately (so dividends are not double-counted).
+    """
     if (
         not ticker
         or ticker.upper() in ["UNKNOWN", "NONE", "NULL", "N/A"]
+        or not shares
         or shares <= 0
     ):
-        return 0.0, 0.0, 0.0, est_value_db, 0.0, 0.0
+        return NO_PERF
 
     clean_date_str = str(tx_date_str)[:10]
     cleaned_ticker = ticker.replace(".", "-")
@@ -60,78 +74,75 @@ def calculate_trade_performance(
     try:
         stock = yf.Ticker(cleaned_ticker)
         tx_date = pd.to_datetime(clean_date_str)
-        current_price = stock.fast_info.get("lastPrice") or stock.info.get(
-            "currentPrice"
-        )
-        hist = stock.history(start=clean_date_str)
+        hist = stock.history(start=clean_date_str, auto_adjust=False)
         if hist.empty:
-            return 0.0, 0.0, 0.0, est_value_db, 0.0, 0.0
-        if not current_price:
-            current_price = hist["Close"].iloc[-1]
+            return NO_PERF
 
-        tx_price_adj = hist["Close"].iloc[0]
-        if tx_price_adj <= 0:
-            return 0.0, 0.0, 0.0, est_value_db, 0.0, 0.0
+        # Base = first close on/after the transaction date; refuse a base more than 7 days away.
+        base_dt = hist.index[0].tz_localize(None) if hist.index.tz is not None else hist.index[0]
+        if (base_dt - tx_date).days > 7:
+            return NO_PERF
+        base_price = float(hist["Close"].iloc[0])
+        if base_price <= 0:
+            return NO_PERF
 
-        true_est_value = shares * tx_price_adj
-        stock_pct_return = (current_price - tx_price_adj) / tx_price_adj
+        current_price = stock.fast_info.get("lastPrice") or float(hist["Close"].iloc[-1])
+        if not current_price or current_price <= 0:
+            return NO_PERF
 
-        start_30d = tx_date - pd.Timedelta(days=30)
-        hist_30d = stock.history(
-            start=start_30d.strftime("%Y-%m-%d"), end=clean_date_str
-        )
-        price_30d_change_pct = 0.0
-        if not hist_30d.empty and len(hist_30d) >= 2:
-            old_p = hist_30d["Close"].iloc[0]
-            new_p = hist_30d["Close"].iloc[-1]
-            if old_p > 0:
-                price_30d_change_pct = ((new_p - old_p) / old_p) * 100.0
+        base_value = shares * base_price
+        capital_gain = shares * (current_price - base_price)
 
-        capital_gain = true_est_value * stock_pct_return
         dividends = stock.dividends
         total_div_dollar = 0.0
         if not dividends.empty:
             if dividends.index.tz is not None:
                 dividends.index = dividends.index.tz_localize(None)
             total_div_per_share = dividends[dividends.index >= tx_date].sum()
-            total_div_dollar = shares * total_div_per_share
+            total_div_dollar = shares * float(total_div_per_share)
 
         total_dollar_return = capital_gain + total_div_dollar
-        percent_return = (
-            (total_dollar_return / true_est_value) * 100
-            if true_est_value > 0
-            else 0.0
-        )
+        percent_return = (total_dollar_return / base_value) * 100.0
 
-        benchmark_pct_return = 0.0
+        # Price drift in the 30 days BEFORE the purchase (used by the conviction score).
+        price_30d_change_pct = None
+        start_30d = tx_date - pd.Timedelta(days=30)
+        hist_30d = stock.history(
+            start=start_30d.strftime("%Y-%m-%d"), end=clean_date_str, auto_adjust=False
+        )
+        if not hist_30d.empty and len(hist_30d) >= 2:
+            old_p = float(hist_30d["Close"].iloc[0])
+            new_p = float(hist_30d["Close"].iloc[-1])
+            if old_p > 0:
+                price_30d_change_pct = ((new_p - old_p) / old_p) * 100.0
+
+        benchmark_pct_return = None
         if benchmark_ticker and benchmark_ticker not in ["None", "UNKNOWN", ""]:
             try:
                 b_stock = yf.Ticker(benchmark_ticker)
-                b_hist = b_stock.history(start=clean_date_str)
-                if not b_hist.empty and len(b_hist) >= 1:
-                    b_start_price = b_hist["Close"].iloc[0]
-                    b_current_price = b_stock.fast_info.get(
-                        "lastPrice"
-                    ) or b_hist["Close"].iloc[-1]
-                    if b_start_price > 0:
-                        benchmark_pct_return = (
-                            (b_current_price - b_start_price) / b_start_price
-                        ) * 100.0
+                b_hist = b_stock.history(start=clean_date_str, auto_adjust=False)
+                if not b_hist.empty:
+                    b_start = float(b_hist["Close"].iloc[0])
+                    b_cur = b_stock.fast_info.get("lastPrice") or float(b_hist["Close"].iloc[-1])
+                    if b_start > 0 and b_cur:
+                        benchmark_pct_return = ((b_cur - b_start) / b_start) * 100.0
             except Exception:
                 pass
 
-        alpha_return = percent_return - benchmark_pct_return
-
+        alpha = (
+            percent_return - benchmark_pct_return
+            if benchmark_pct_return is not None
+            else None
+        )
         return (
             total_dollar_return,
             percent_return,
             price_30d_change_pct,
-            true_est_value,
             benchmark_pct_return,
-            alpha_return,
+            alpha,
         )
     except Exception:
-        return 0.0, 0.0, 0.0, est_value_db, 0.0, 0.0
+        return NO_PERF
 
 
 def process_advanced_conviction_metrics(df):
@@ -152,7 +163,8 @@ def process_advanced_conviction_metrics(df):
         shares_following = float(row["shares_owned_following"]) if pd.notnull(row["shares_owned_following"]) else 0.0
         est_val = float(row["est_value"]) if pd.notnull(row["est_value"]) else 0.0
         market_cap = float(row["market_cap"]) if pd.notnull(row["market_cap"]) else 0.0
-        price_30d = float(row.get("price_30d_change_pct", 0.0) or 0.0)
+        raw_30d = row.get("price_30d_change_pct")
+        price_30d = float(raw_30d) if pd.notnull(raw_30d) else None
 
         prior_shares = shares_following - shares_bought
         if prior_shares > 0 and shares_bought > 0:
@@ -233,7 +245,10 @@ def process_advanced_conviction_metrics(df):
             score += 10
             breakdown.append("Multi-Insider Buy (2): +10")
 
-        if price_30d < -30.0:
+        # Price-drift rules only apply when we actually have the prior-30-day price data.
+        if price_30d is None:
+            breakdown.append("30-day price trend unavailable: 0")
+        elif price_30d < -30.0:
             score -= 25
             breakdown.append(f"Deep drop value trap filter ({price_30d:.1f}%): -25")
         elif price_30d < -15.0:
@@ -265,6 +280,12 @@ def process_advanced_conviction_metrics(df):
     )
 
 
+def fmt_pct(x):
+    if x is None or pd.isnull(x):
+        return "N/A"
+    return f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
+
+
 def enrich_dataframe(df):
     """Applies live YFinance performance calculations, conviction scoring, and formatting."""
     if df.empty:
@@ -285,7 +306,6 @@ def enrich_dataframe(df):
         "bench_return_60d_pct": "first",
         "bench_return_180d_pct": "first",
     }
-    # Keep only columns that exist in df
     active_agg = {k: v for k, v in agg_rules.items() if k in df.columns}
     df = df.groupby(group_cols, as_index=False).agg(active_agg)
 
@@ -302,16 +322,14 @@ def enrich_dataframe(df):
             row.get("benchmark_ticker"),
             row["transaction_date"],
             float(row["shares_bought"] or 0),
-            float(row["est_value"] or 0),
         )
         for _, row in df.iterrows()
     ]
-    df["Unrealized Profit ($)"] = [p[0] for p in perf]
-    df["Return (%)"] = [p[1] for p in perf]
-    df["price_30d_change_pct"] = [p[2] for p in perf]
-    df["est_value"] = [p[3] for p in perf]
-    df["Benchmark Return (%)"] = [p[4] for p in perf]
-    df["Alpha Return (%)"] = [p[5] for p in perf]
+    df["Unrealized Profit ($)"] = pd.to_numeric([p[0] for p in perf], errors="coerce")
+    df["Return (%)"] = pd.to_numeric([p[1] for p in perf], errors="coerce")
+    df["price_30d_change_pct"] = pd.to_numeric([p[2] for p in perf], errors="coerce")
+    df["Benchmark Return (%)"] = pd.to_numeric([p[3] for p in perf], errors="coerce")
+    df["Alpha Return (%)"] = pd.to_numeric([p[4] for p in perf], errors="coerce")
 
     df = process_advanced_conviction_metrics(df)
 
@@ -345,19 +363,21 @@ def enrich_dataframe(df):
 
     current_date = pd.Timestamp.now().normalize()
 
+    def is_new(row):
+        tx_date = pd.to_datetime(str(row["transaction_date"])[:10])
+        return (current_date - tx_date).days <= 2
+
     def format_gain(row):
         profit = row["Unrealized Profit ($)"]
-        tx_date = pd.to_datetime(str(row["transaction_date"])[:10])
-        if (current_date - tx_date).days <= 2 and profit == 0:
-            return "N/A (New)"
+        if pd.isnull(profit):
+            return "N/A (New)" if is_new(row) else "N/A"
         return f"+${profit:,.0f}" if profit >= 0 else f"-${abs(profit):,.0f}"
 
     def format_return(row):
         ret = row["Return (%)"]
-        tx_date = pd.to_datetime(str(row["transaction_date"])[:10])
-        if (current_date - tx_date).days <= 2 and ret == 0:
-            return "N/A (New)"
-        return f"+{ret:.1f}%" if ret >= 0 else f"{ret:.1f}%"
+        if pd.isnull(ret):
+            return "N/A (New)" if is_new(row) else "N/A"
+        return fmt_pct(ret)
 
     df["Unrealized Gain"] = df.apply(format_gain, axis=1)
     df["Total Return"] = df.apply(format_return, axis=1)
@@ -369,7 +389,7 @@ def enrich_dataframe(df):
 
         if pd.notnull(s_ret) and pd.notnull(b_ret):
             alpha_val = float(s_ret) - float(b_ret)
-            return alpha_val, (f"+{alpha_val:.1f}%" if alpha_val >= 0 else f"{alpha_val:.1f}%")
+            return alpha_val, fmt_pct(alpha_val)
 
         days_elapsed = (current_date - tx_date).days
         if days_elapsed < days_required:
@@ -388,14 +408,16 @@ def enrich_dataframe(df):
     df["alpha_180d_num"] = [res[0] for res in alpha_180_results]
     df["180D Alpha"] = [res[1] for res in alpha_180_results]
 
-    df["Benchmark Return"] = df["Benchmark Return (%)"].apply(
-        lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
-    )
-    df["Alpha Return"] = df["Alpha Return (%)"].apply(
-        lambda x: f"+{x:.1f}%" if x >= 0 else f"{x:.1f}%"
-    )
+    df["Benchmark Return"] = df["Benchmark Return (%)"].apply(fmt_pct)
+    df["Alpha Return"] = df["Alpha Return (%)"].apply(fmt_pct)
 
     return df
+
+
+FEED_COLUMNS = """transaction_date, ticker, sector, insider_name, insider_title,
+                   shares_bought, shares_owned_following, est_value,
+                   market_cap, market_cap_category, benchmark_ticker,
+                   return_60d_pct, return_180d_pct, bench_return_60d_pct, bench_return_180d_pct"""
 
 
 @st.cache_data(ttl=600)
@@ -403,10 +425,13 @@ def load_filtered_feed(selected_year, selected_month, max_rows):
     conn = get_db_connection()
     try:
         where_clauses = []
+        params = []
+        # transaction_date is a DATE in the view, so use EXTRACT (text functions like LEFT fail on dates).
         if selected_year == "Older":
-            where_clauses.append("LEFT(transaction_date, 4) < '2024'")
+            where_clauses.append("EXTRACT(YEAR FROM transaction_date::date) < 2024")
         elif selected_year != "All Years":
-            where_clauses.append(f"LEFT(transaction_date, 4) = '{selected_year}'")
+            where_clauses.append("EXTRACT(YEAR FROM transaction_date::date) = %s")
+            params.append(int(selected_year))
 
         months_list = [
             "All Months", "January", "February", "March", "April", "May", "June",
@@ -414,22 +439,20 @@ def load_filtered_feed(selected_year, selected_month, max_rows):
         ]
         if selected_month != "All Months":
             month_idx = months_list.index(selected_month)
-            month_str = f"{month_idx:02d}"
-            where_clauses.append(f"SUBSTRING(transaction_date, 6, 2) = '{month_str}'")
+            where_clauses.append("EXTRACT(MONTH FROM transaction_date::date) = %s")
+            params.append(int(month_idx))
 
         where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+        params.append(int(max_rows))
 
         query = f"""
-            SELECT transaction_date, ticker, sector, insider_name, insider_title, 
-                   shares_bought, shares_owned_following, est_value,
-                   market_cap, market_cap_category, benchmark_ticker,
-                   return_60d_pct, return_180d_pct, bench_return_60d_pct, bench_return_180d_pct
-            FROM insider_trades 
+            SELECT {FEED_COLUMNS}
+            FROM {SOURCE_VIEW}
             {where_sql}
             ORDER BY transaction_date DESC
-            LIMIT {max_rows};
+            LIMIT %s;
         """
-        df = pd.read_sql(query, conn)
+        df = pd.read_sql(query, conn, params=params)
     finally:
         conn.close()
 
@@ -437,20 +460,17 @@ def load_filtered_feed(selected_year, selected_month, max_rows):
 
 
 @st.cache_data(ttl=600)
-def load_full_history_for_directory(limit_rows=2500):
+def load_full_history_for_directory(limit_rows=20000):
     """Fast load using ONLY pre-computed Supabase columns (zero live yfinance calls) so Tab 2 loads instantaneously."""
     conn = get_db_connection()
     try:
         query = f"""
-            SELECT transaction_date, ticker, sector, insider_name, insider_title, 
-                   shares_bought, shares_owned_following, est_value,
-                   market_cap, market_cap_category, benchmark_ticker,
-                   return_60d_pct, return_180d_pct, bench_return_60d_pct, bench_return_180d_pct
-            FROM insider_trades 
+            SELECT {FEED_COLUMNS}
+            FROM {SOURCE_VIEW}
             ORDER BY transaction_date DESC
-            LIMIT {limit_rows};
+            LIMIT %s;
         """
-        df = pd.read_sql(query, conn)
+        df = pd.read_sql(query, conn, params=[int(limit_rows)])
     finally:
         conn.close()
 
@@ -480,7 +500,7 @@ def load_full_history_for_directory(limit_rows=2500):
         b_ret = row.get(bench_ret_col)
         if pd.notnull(s_ret) and pd.notnull(b_ret):
             alpha_val = float(s_ret) - float(b_ret)
-            return alpha_val, (f"+{alpha_val:.1f}%" if alpha_val >= 0 else f"{alpha_val:.1f}%")
+            return alpha_val, fmt_pct(alpha_val)
         days_elapsed = (current_date - row["parsed_date"]).days
         return None, ("Pending" if days_elapsed < days_required else "N/A")
 
@@ -679,7 +699,7 @@ with tab2:
     st.subheader("🕵️ Recent Buyers & Historical Track Record")
     st.write("Sorted by **Most Recent Purchase** so you can vet active buyers against their matured 60D & 180D benchmark alpha.")
 
-    dir_raw = load_full_history_for_directory(limit_rows=2500)
+    dir_raw = load_full_history_for_directory()
     dir_source = filter_out_institutions(dir_raw, hide_institutions)
 
     if not dir_source.empty:
@@ -722,8 +742,8 @@ with tab2:
                 "All Tickers": all_tickers,
                 "Total Trades": total_trades,
                 "Matured Trades": matured_trade_count,
-                "Avg 60D Alpha": f"+{avg_60_alpha:.1f}%" if avg_60_alpha is not None and avg_60_alpha >= 0 else (f"{avg_60_alpha:.1f}%" if avg_60_alpha is not None else "N/A"),
-                "Avg 180D Alpha": f"+{avg_180_alpha:.1f}%" if avg_180_alpha is not None and avg_180_alpha >= 0 else (f"{avg_180_alpha:.1f}%" if avg_180_alpha is not None else "N/A"),
+                "Avg 60D Alpha": fmt_pct(avg_60_alpha),
+                "Avg 180D Alpha": fmt_pct(avg_180_alpha),
                 "Total Invested ($)": f"${total_invested:,.0f}",
             })
 
@@ -765,11 +785,11 @@ with tab2:
             enriched_buyer_df = enrich_dataframe(raw_buyer_df).sort_values(by="parsed_date", ascending=False)
 
             purchaser_trades = enriched_buyer_df[[
-                "transaction_date", "ticker", "Conviction Score", "Conviction Tier", 
+                "transaction_date", "ticker", "Conviction Score", "Conviction Tier",
                 "Shares Bought", "Est. Value ($)", "Total Return", "Alpha Return", "60D Alpha", "180D Alpha"
             ]]
             purchaser_trades.columns = [
-                "Transaction Date", "Ticker", "Score", "Tier", 
+                "Transaction Date", "Ticker", "Score", "Tier",
                 "Shares Bought", "Est. Value ($)", "Current Return", "Current Alpha", "60D Alpha", "180D Alpha"
             ]
             st.dataframe(purchaser_trades, use_container_width=True)
