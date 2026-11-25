@@ -756,6 +756,14 @@ with tab2:
                 else:
                     rating = "📉 Poor Performer"
 
+            # Episodes old enough to have a 60D/180D result but with NO price data (delisted, acquired,
+            # foreign...). They can't be scored, so show them and flag the rating instead of hiding them.
+            elapsed_days = (pd.Timestamp.now().normalize() - episodes["parsed_date"]).dt.days
+            unpriced = int((episodes["alpha_60d_num"].isna() & episodes["alpha_180d_num"].isna()
+                            & (elapsed_days >= 90)).sum())
+            if n_episodes and unpriced / n_episodes > 0.2 and not rating.startswith("⏳"):
+                rating += " ⚠️"
+
             grouped_records.append({
                 "Latest Purchase": latest_tx_date,
                 "Buyer Key": buyer_key,
@@ -766,6 +774,7 @@ with tab2:
                 "Purchases": total_trades,
                 "Buying Episodes": n_episodes,
                 "Matured Episodes": matured_trade_count,
+                "No Price Data": unpriced,
                 "Avg 60D Alpha": fmt_pct(avg_60_alpha),
                 "Avg 180D Alpha": fmt_pct(avg_180_alpha),
                 "Total Invested ($)": f"${total_invested:,.0f}",
