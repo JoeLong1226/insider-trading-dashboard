@@ -464,10 +464,14 @@ def load_full_history_for_directory(limit_rows=20000):
     """Fast load using ONLY pre-computed Supabase columns (zero live yfinance calls) so Tab 2 loads instantaneously."""
     conn = get_db_connection()
     try:
+        # Each row is attributed to a BUYER (a person plus the funds/firms filing with them),
+        # built by build_buyer_groups.py + link_buyers.sql. Rows with no buyer yet fall back to the name.
         query = f"""
-            SELECT {FEED_COLUMNS}
-            FROM {SOURCE_VIEW}
-            ORDER BY transaction_date DESC
+            SELECT v.*, t.buyer_id, b.display_name AS buyer_name
+            FROM {SOURCE_VIEW} v
+            LEFT JOIN insider_trades t ON t.id = v.id
+            LEFT JOIN buyers b ON b.buyer_id = t.buyer_id
+            ORDER BY v.transaction_date DESC
             LIMIT %s;
         """
         df = pd.read_sql(query, conn, params=[int(limit_rows)])
@@ -477,7 +481,13 @@ def load_full_history_for_directory(limit_rows=20000):
     if df.empty:
         return df
 
-    df = df.groupby(["transaction_date", "ticker", "insider_name"], as_index=False).agg({
+    df["buyer_key"] = df["buyer_id"].apply(lambda x: f"b{int(x)}" if pd.notnull(x) else None)
+    df["buyer_key"] = df["buyer_key"].fillna("n:" + df["insider_name"].astype(str))
+    df["buyer_name"] = df["buyer_name"].fillna(df["insider_name"])
+
+    df = df.groupby(["transaction_date", "ticker", "buyer_key"], as_index=False).agg({
+        "buyer_name": "first",
+        "insider_name": "first",
         "sector": "first",
         "insider_title": "first",
         "shares_bought": "sum",
@@ -511,6 +521,9 @@ def load_full_history_for_directory(limit_rows=20000):
     a180 = df.apply(lambda r: compute_horizon_alpha(r, "return_180d_pct", "bench_return_180d_pct", 180), axis=1)
     df["alpha_180d_num"] = [x[0] for x in a180]
     df["180D Alpha"] = [x[1] for x in a180]
+
+    # From here on the buyer's display name is the name shown everywhere on the directory tab
+    df["insider_name"] = df["buyer_name"]
 
     return df
 
@@ -706,7 +719,8 @@ with tab2:
         search_query = st.text_input("🔍 Search by Purchaser Name or Ticker:", "", key="dir_search")
 
         grouped_records = []
-        for insider, grp in dir_source.groupby("insider_name"):
+        for buyer_key, grp in dir_source.groupby("buyer_key"):
+            insider = grp["insider_name"].iloc[0]
             grp_sorted = grp.sort_values(by="parsed_date", ascending=False)
             latest_tx_date = str(grp_sorted["transaction_date"].iloc[0])[:10]
             latest_ticker = grp_sorted["ticker"].iloc[0]
@@ -721,7 +735,7 @@ with tab2:
             avg_180_alpha = matured_180.mean() if not matured_180.empty else None
             matured_trade_count = len(grp_sorted[grp_sorted["alpha_60d_num"].notnull() | grp_sorted["alpha_180d_num"].notnull()])
 
-            if matured_trade_count < 2:
+            if matured_trade_count < 3:   # launch bar: no rating until 3 matured purchases
                 rating = "⏳ No Mature Data"
             else:
                 valid_horizon_means = [x for x in [avg_60_alpha, avg_180_alpha] if x is not None]
@@ -736,6 +750,7 @@ with tab2:
 
             grouped_records.append({
                 "Latest Purchase": latest_tx_date,
+                "Buyer Key": buyer_key,
                 "Insider Name": insider,
                 "Track Record Rating": rating,
                 "Latest Ticker": latest_ticker,
@@ -761,6 +776,7 @@ with tab2:
         p_event = st.dataframe(
             agg_df,
             use_container_width=True,
+            column_config={"Buyer Key": None},
             on_select="rerun",
             selection_mode="single-row",
             key="purchaser_table_selection"
@@ -770,6 +786,7 @@ with tab2:
         if len(p_selected_indices) > 0:
             chosen_row = agg_df.iloc[p_selected_indices[0]]
             chosen_purchaser = chosen_row["Insider Name"]
+            chosen_key = chosen_row["Buyer Key"]
 
             st.markdown("---")
             st.markdown(f"### 📄 Full Trade History & Horizon Alpha: {chosen_purchaser}")
@@ -781,7 +798,7 @@ with tab2:
             m4.metric("Avg 180D Alpha vs Benchmark", chosen_row["Avg 180D Alpha"])
 
             # Enrich ONLY the selected buyer's trades on demand (fast!)
-            raw_buyer_df = dir_source[dir_source["insider_name"] == chosen_purchaser].copy()
+            raw_buyer_df = dir_source[dir_source["buyer_key"] == chosen_key].copy()
             enriched_buyer_df = enrich_dataframe(raw_buyer_df).sort_values(by="parsed_date", ascending=False)
 
             purchaser_trades = enriched_buyer_df[[
