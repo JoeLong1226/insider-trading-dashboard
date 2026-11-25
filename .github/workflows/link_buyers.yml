@@ -1,5 +1,7 @@
 name: Link Buyers
 
+# Nightly: pull the newest Form 4 filings from EDGAR, regroup owners into buyers,
+# link every trade row to its buyer, then refresh the data-quality flags.
 on:
   workflow_dispatch:
   schedule:
@@ -10,9 +12,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  link:
+  nightly:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
+    env:
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,7 +25,16 @@ jobs:
       - run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Link trades to buyers
-        env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+
+      - name: 1. Load recent filings from EDGAR
+        continue-on-error: true
+        run: python load_recent_filings.py
+
+      - name: 2. Group owners into buyers
+        run: python build_buyer_groups.py db
+
+      - name: 3. Link trades to buyers
         run: python link_buyers.py
+
+      - name: 4. Refresh data-quality flags
+        run: python -c "import os, psycopg2; c = psycopg2.connect(os.environ['SUPABASE_DB_URL']); cur = c.cursor(); cur.execute('SELECT refresh_dq();'); c.commit(); print('refresh_dq done')"
