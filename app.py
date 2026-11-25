@@ -728,14 +728,22 @@ with tab2:
             total_trades = len(grp_sorted)
             total_invested = grp_sorted["est_value"].sum()
 
-            matured_60 = grp_sorted["alpha_60d_num"].dropna()
-            matured_180 = grp_sorted["alpha_180d_num"].dropna()
+            # BUYING EPISODES: purchases of the same ticker by the same buyer, each within 30 days of the
+            # previous one, are ONE decision. Performance is measured from the FIRST purchase of each episode.
+            asc = grp_sorted.sort_values(["ticker", "parsed_date"])
+            gap_days = asc.groupby("ticker")["parsed_date"].diff().dt.days
+            asc = asc.assign(_new_ep=(gap_days.isna() | (gap_days > 30)))
+            episodes = asc[asc["_new_ep"]]
+            n_episodes = len(episodes)
+
+            matured_60 = episodes["alpha_60d_num"].dropna()
+            matured_180 = episodes["alpha_180d_num"].dropna()
 
             avg_60_alpha = matured_60.mean() if not matured_60.empty else None
             avg_180_alpha = matured_180.mean() if not matured_180.empty else None
-            matured_trade_count = len(grp_sorted[grp_sorted["alpha_60d_num"].notnull() | grp_sorted["alpha_180d_num"].notnull()])
+            matured_trade_count = len(episodes[episodes["alpha_60d_num"].notnull() | episodes["alpha_180d_num"].notnull()])
 
-            if matured_trade_count < 3:   # launch bar: no rating until 3 matured purchases
+            if matured_trade_count < 3:   # launch bar: no rating until 3 matured buying episodes
                 rating = "⏳ No Mature Data"
             else:
                 valid_horizon_means = [x for x in [avg_60_alpha, avg_180_alpha] if x is not None]
@@ -755,8 +763,9 @@ with tab2:
                 "Track Record Rating": rating,
                 "Latest Ticker": latest_ticker,
                 "All Tickers": all_tickers,
-                "Total Trades": total_trades,
-                "Matured Trades": matured_trade_count,
+                "Purchases": total_trades,
+                "Buying Episodes": n_episodes,
+                "Matured Episodes": matured_trade_count,
                 "Avg 60D Alpha": fmt_pct(avg_60_alpha),
                 "Avg 180D Alpha": fmt_pct(avg_180_alpha),
                 "Total Invested ($)": f"${total_invested:,.0f}",
@@ -793,7 +802,8 @@ with tab2:
 
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Track Record Rating", chosen_row["Track Record Rating"])
-            m2.metric("Matured Trades (60D+)", f"{chosen_row['Matured Trades']} of {chosen_row['Total Trades']}")
+            m2.metric("Matured Episodes (60D+)", f"{chosen_row['Matured Episodes']} of {chosen_row['Buying Episodes']}",
+                      help="An episode = purchases of the same stock within 30 days of each other, counted once, measured from the first purchase.")
             m3.metric("Avg 60D Alpha vs Benchmark", chosen_row["Avg 60D Alpha"])
             m4.metric("Avg 180D Alpha vs Benchmark", chosen_row["Avg 180D Alpha"])
 
