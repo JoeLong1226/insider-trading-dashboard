@@ -14,7 +14,7 @@ concurrency:
 jobs:
   nightly:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
     steps:
@@ -28,7 +28,7 @@ jobs:
 
       - name: 1. Load recent filings from EDGAR
         continue-on-error: true
-        run: python load_recent_filings.py
+        run: python load_recent_filings.py --max 1500
 
       - name: 2. Group owners into buyers
         run: python build_buyer_groups.py db
@@ -36,5 +36,7 @@ jobs:
       - name: 3. Link trades to buyers
         run: python link_buyers.py
 
+      - name: 4. Refresh data-quality flags
+        run: python -c "import os, psycopg2; c = psycopg2.connect(os.environ['SUPABASE_DB_URL']); cur = c.cursor(); cur.execute('SELECT refresh_dq();'); c.commit(); print('refresh_dq done')"
       - name: 4. Refresh data-quality flags
         run: python -c "import os, psycopg2; c = psycopg2.connect(os.environ['SUPABASE_DB_URL']); cur = c.cursor(); cur.execute('SELECT refresh_dq();'); c.commit(); print('refresh_dq done')"
