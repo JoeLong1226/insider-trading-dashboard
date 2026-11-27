@@ -68,8 +68,11 @@ def classify(members, weight):
         btype = "group"          # a firm with several principals: attribute to the FIRM, not one person
     else:
         btype = "institution"
+    entities = [m for m in members if is_entity(m)]
     if btype == "person":
         display = people[0]
+    elif entities:
+        display = max(entities, key=lambda m: weight.get(m, 0))   # name a firm group after the firm
     else:
         display = max(members, key=lambda m: weight.get(m, 0))
     return btype, display, len(people)
@@ -219,6 +222,7 @@ def build_db():
 
     # Rebuild from scratch each run (members reference buyers, so clear members first).
     # Decisions live in buyer_merge_suggestions.status, so nothing a human decided is lost.
+    cur.execute("ALTER TABLE buyers ADD COLUMN IF NOT EXISTS member_names text")
     cur.execute("DELETE FROM buyer_members")
     cur.execute("UPDATE insider_trades SET buyer_id = NULL WHERE buyer_id IS NOT NULL")
     cur.execute("DELETE FROM buyers")
@@ -226,8 +230,9 @@ def build_db():
         names = [name_of[c] for c in ciks]
         w = {name_of[c]: weight[c] for c in ciks}
         btype, display, npeople = classify(names, w)
-        cur.execute("INSERT INTO buyers (display_name, buyer_type, n_people) VALUES (%s,%s,%s) RETURNING buyer_id",
-                    (display, btype, npeople))
+        member_names = " | ".join(sorted(set(names)))[:3000]     # lets the site search every name
+        cur.execute("INSERT INTO buyers (display_name, buyer_type, n_people, member_names) VALUES (%s,%s,%s,%s) RETURNING buyer_id",
+                    (display, btype, npeople, member_names))
         bid = cur.fetchone()[0]
         for c in ciks:
             cur.execute("""INSERT INTO buyer_members (owner_cik, buyer_id, link_method, confidence)
