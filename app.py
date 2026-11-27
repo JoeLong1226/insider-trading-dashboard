@@ -467,7 +467,7 @@ def load_full_history_for_directory(limit_rows=20000):
         # Each row is attributed to a BUYER (a person plus the funds/firms filing with them),
         # built by build_buyer_groups.py + link_buyers.sql. Rows with no buyer yet fall back to the name.
         query = f"""
-            SELECT v.*, t.buyer_id, b.display_name AS buyer_name
+            SELECT v.*, t.buyer_id, b.display_name AS buyer_name, b.member_names
             FROM {SOURCE_VIEW} v
             LEFT JOIN insider_trades t ON t.id = v.id
             LEFT JOIN buyers b ON b.buyer_id = t.buyer_id
@@ -484,9 +484,11 @@ def load_full_history_for_directory(limit_rows=20000):
     df["buyer_key"] = df["buyer_id"].apply(lambda x: f"b{int(x)}" if pd.notnull(x) else None)
     df["buyer_key"] = df["buyer_key"].fillna("n:" + df["insider_name"].astype(str))
     df["buyer_name"] = df["buyer_name"].fillna(df["insider_name"])
+    df["member_names"] = df["member_names"].fillna("")
 
     df = df.groupby(["transaction_date", "ticker", "buyer_key"], as_index=False).agg({
         "buyer_name": "first",
+        "member_names": "first",
         "insider_name": "first",
         "sector": "first",
         "insider_title": "first",
@@ -767,6 +769,7 @@ with tab2:
             grouped_records.append({
                 "Latest Purchase": latest_tx_date,
                 "Buyer Key": buyer_key,
+                "Search Text": f"{insider} {grp['member_names'].iloc[0]}",
                 "Insider Name": insider,
                 "Track Record Rating": rating,
                 "Latest Ticker": latest_ticker,
@@ -786,6 +789,7 @@ with tab2:
             q = search_query.upper()
             agg_df = agg_df[
                 agg_df["Insider Name"].str.upper().str.contains(q, na=False) |
+                agg_df["Search Text"].str.upper().str.contains(q, regex=False, na=False) |
                 agg_df["All Tickers"].str.upper().str.contains(q, na=False)
             ]
 
@@ -794,7 +798,7 @@ with tab2:
         p_event = st.dataframe(
             agg_df,
             use_container_width=True,
-            column_config={"Buyer Key": None},
+            column_config={"Buyer Key": None, "Search Text": None},
             on_select="rerun",
             selection_mode="single-row",
             key="purchaser_table_selection"
